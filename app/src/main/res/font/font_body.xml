@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    "Rajdhani" — clean, slightly-condensed technical sans used for body text
+    in English/Latin layouts (issue #7). See font_display.xml for replacement
+    instructions; same approach applies here.
+
+    Download (OFL licensed):
+      https://fonts.google.com/specimen/Rajdhani
+    Files to replace:
+      res/font/rajdhani_regular.ttf   <- Rajdhani Regular  (weight 400)
+      res/font/rajdhani_medium.ttf    <- Rajdhani Medium   (weight 500)
+      res/font/rajdhani_semibold.ttf  <- Rajdhani SemiBold (weight 600)
+-->
+<font-family xmlns:android="http://schemas.android.com/apk/res/android">
+    <font
+        android:fontStyle="normal"
+        android:fontWeight="400"
+        android:font="@font/rajdhani_regular" />
+    <font
+        android:fontStyle="normal"
+        android:fontWeight="500"
+        android:font="@font/rajdhani_medium" />
+    <font
+        android:fontStyle="normal"
+        android:fontWeight="600"
+        android:font="@font/rajdhani_semibold" />
+</font-family>

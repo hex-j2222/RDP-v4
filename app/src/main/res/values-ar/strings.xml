@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HexRDP</string>
+
+    <!-- Home -->
+    <string name="no_connections">لا توجد اتصالات بعد</string>
+    <string name="add_first_connection">أضف أول اتصال RDP للبدء</string>
+    <string name="add_connection">إضافة اتصال</string>
+    <string name="connect">اتصال</string>
+    <string name="edit">تعديل</string>
+    <string name="delete">حذف</string>
+    <string name="save">حفظ</string>
+    <string name="cancel">إلغاء</string>
+
+    <!-- Profile Form -->
+    <string name="new_connection">اتصال جديد</string>
+    <string name="edit_profile">تعديل الملف الشخصي</string>
+    <string name="connection_name">اسم الاتصال</string>
+    <string name="host_ip">المضيف / عنوان IP</string>
+    <string name="port">المنفذ</string>
+    <string name="username">اسم المستخدم</string>
+    <string name="password">كلمة المرور</string>
+    <string name="domain_optional">النطاق (اختياري)</string>
+    <string name="use_nla">استخدام مصادقة NLA</string>
+    <string name="resolution">دقة الشاشة</string>
+    <string name="resolution_auto">تلقائي (مطابقة الجهاز)</string>
+    <string name="resolution_custom">مخصص…</string>
+    <string name="width">العرض</string>
+    <string name="height">الارتفاع</string>
+
+    <!-- Delete -->
+    <string name="delete_confirm_title">حذف الاتصال</string>
+    <string name="delete_confirm_message">هل أنت متأكد من حذف \"%s\"؟</string>
+
+    <!-- Subscribe -->
+    <string name="welcome_title">مرحباً بك في HexRDP</string>
+    <string name="welcome_message">انضم إلى قناتنا على تيليجرام للحصول على التحديثات والنصائح والدعم من مجتمع المطورين.</string>
+    <string name="subscribe_title">ابقَ على تواصل</string>
+    <string name="subscribe_message">احصل على أحدث التحديثات والنصائح بالانضمام إلى قناتنا على تيليجرام.</string>
+    <string name="join_channel">انضم لقناة تيليجرام</string>
+    <string name="later">لاحقاً</string>
+
+    <!-- Network -->
+    <string name="poor_network_warning">تم اكتشاف شبكة ضعيفة — يتم تفعيل وضع النطاق الترددي المنخفض</string>
+
+    <!-- Settings -->
+    <string name="settings">الإعدادات</string>
+    <string name="appearance">المظهر</string>
+    <string name="dark_mode">الوضع الداكن</string>
+    <string name="dark">داكن</string>
+    <string name="light">فاتح</string>
+    <string name="theme">الثيم</string>
+    <string name="theme_space">الفضاء العميق</string>
+    <string name="theme_nebula">سديم</string>
+    <string name="theme_aurora">أورورا</string>
+    <string name="language">اللغة</string>
+    <string name="lang_system">افتراضي النظام</string>
+
+    <string name="cursor_input">المؤشر والإدخال</string>
+    <string name="cursor_style">شكل المؤشر</string>
+    <string name="cursor_default">سهم افتراضي</string>
+    <string name="cursor_crosshair">شعاع متقاطع</string>
+    <string name="cursor_dot">نقطة</string>
+    <string name="cursor_circle">دائرة</string>
+    <string name="cursor_size">حجم المؤشر</string>
+    <string name="touchpad_sensitivity">حساسية لوحة اللمس</string>
+    <string name="haptic_feedback">الاهتزاز اللمسي</string>
+    <string name="sound_effects">المؤثرات الصوتية</string>
+    <string name="sound_effects_desc">تشغيل أصوات قصيرة عند اللمس والتبديل وأحداث الاتصال</string>
+
+    <string name="connection">الاتصال</string>
+    <string name="auto_reconnect">إعادة الاتصال تلقائياً</string>
+    <string name="compression_quality">جودة الضغط</string>
+    <string name="default_resolution">دقة الشاشة الافتراضية</string>
+    <string name="run_in_background">إبقاء الاتصال يعمل في الخلفية</string>
+    <string name="run_in_background_desc">يبقى الاتصال متصلاً عند تبديل التطبيقات أو قفل الشاشة</string>
+
+    <string name="session_controls">أدوات التحكم داخل الجلسة</string>
+    <string name="show_toolbar_by_default">إظهار شريط الأدوات تلقائياً</string>
+    <string name="show_extra_keys_by_default">إظهار شريط مفاتيح الاختصارات</string>
+
+    <string name="developer">المطور</string>
+    <string name="developer_telegram">GoToHEX — اضغط لفتح تيليجرام</string>
+    <string name="developer_youtube">@dev-hex404 — اضغط لفتح يوتيوب</string>
+    <string name="about">حول التطبيق</string>
+    <string name="by_developer">بواسطة GoToHEX</string>
+
+    <!-- Background session -->
+    <string name="background_session_channel">جلسات RDP النشطة</string>
+    <string name="background_session_title">جلسة HexRDP نشطة</string>
+    <string name="background_session_text">متصل بـ %1$s — اضغط للعودة</string>
+</resources>

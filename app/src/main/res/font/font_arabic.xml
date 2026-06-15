@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    "Tajawal" — modern, geometric Arabic typeface that pairs well with the
+    Orbitron/Rajdhani Latin pairing above (issue #7). Used automatically for
+    Arabic text via FontFamily fallback (see Theme.kt).
+
+    Download (OFL licensed):
+      https://fonts.google.com/specimen/Tajawal
+    Files to replace:
+      res/font/tajawal_regular.ttf <- Tajawal Regular (weight 400)
+      res/font/tajawal_medium.ttf  <- Tajawal Medium  (weight 500)
+      res/font/tajawal_bold.ttf    <- Tajawal Bold    (weight 700)
+-->
+<font-family xmlns:android="http://schemas.android.com/apk/res/android">
+    <font
+        android:fontStyle="normal"
+        android:fontWeight="400"
+        android:font="@font/tajawal_regular" />
+    <font
+        android:fontStyle="normal"
+        android:fontWeight="500"
+        android:font="@font/tajawal_medium" />
+    <font
+        android:fontStyle="normal"
+        android:fontWeight="700"
+        android:font="@font/tajawal_bold" />
+</font-family>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+        Compose apps only need a minimal XML Activity theme.
+        Theme.AppCompat.DayNight.NoActionBar is always available via
+        appcompat (transitive through activity-compose / hilt-navigation-compose).
+        All real theming is done in Compose via HexRDPTheme.
+    -->
+    <style name="Theme.HexRDP" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/deep_space</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="27">shortEdges</item>
+        <item name="android:enforceStatusBarContrast" tools:targetApi="29">false</item>
+        <item name="android:enforceNavigationBarContrast" tools:targetApi="29">false</item>
+
+        <!--
+            Splash screen attributes (issue #5 — avoid theme flash on restart).
+            On API 31+, installSplashScreen() reads these directly from the
+            activity theme. windowSplashScreenBackground matches the app's
+            dark background so the splash never looks like a "different app"
+            flashing before HexRDPTheme takes over, regardless of which
+            theme/dark-mode the user previously saved.
+        -->
+        <item name="android:windowSplashScreenBackground" tools:targetApi="31">@color/deep_space</item>
+    </style>
+
+    <style name="Theme.HexRDP.Session" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:windowBackground">@color/deep_space</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode" tools:targetApi="27">shortEdges</item>
+        <item name="android:enforceStatusBarContrast" tools:targetApi="29">false</item>
+        <item name="android:enforceNavigationBarContrast" tools:targetApi="29">false</item>
+    </style>
+</resources>

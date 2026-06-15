@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="deep_space">#FF050A18</color>
+    <color name="nebula_violet">#FF1A0A2E</color>
+    <color name="cosmic_blue">#FF0D1B3E</color>
+    <color name="pulsar_cyan">#FF00E5FF</color>
+    <color name="star_dust">#FFE8EAF6</color>
+    <color name="nova_pink">#FFFF2D78</color>
+</resources>

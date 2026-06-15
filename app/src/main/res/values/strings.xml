@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">HexRDP</string>
+
+    <!-- Home -->
+    <string name="no_connections">No Connections Yet</string>
+    <string name="add_first_connection">Add your first RDP connection to get started</string>
+    <string name="add_connection">Add Connection</string>
+    <string name="connect">Connect</string>
+    <string name="edit">Edit</string>
+    <string name="delete">Delete</string>
+    <string name="save">Save</string>
+    <string name="cancel">Cancel</string>
+
+    <!-- Profile Form -->
+    <string name="new_connection">New Connection</string>
+    <string name="edit_profile">Edit Profile</string>
+    <string name="connection_name">Connection Name</string>
+    <string name="host_ip">Host / IP Address</string>
+    <string name="port">Port</string>
+    <string name="username">Username</string>
+    <string name="password">Password</string>
+    <string name="domain_optional">Domain (optional)</string>
+    <string name="use_nla">Use NLA Authentication</string>
+    <string name="resolution">Display Resolution</string>
+    <string name="resolution_auto">Auto (match device)</string>
+    <string name="resolution_custom">Custom…</string>
+    <string name="width">Width</string>
+    <string name="height">Height</string>
+
+    <!-- Delete -->
+    <string name="delete_confirm_title">Delete Connection</string>
+    <string name="delete_confirm_message">Are you sure you want to delete \"%s\"?</string>
+
+    <!-- Subscribe -->
+    <string name="welcome_title">Welcome to HexRDP</string>
+    <string name="welcome_message">Join our Telegram channel for updates, tips, and support from the developer community.</string>
+    <string name="subscribe_title">Stay Connected</string>
+    <string name="subscribe_message">Get the latest updates and tips by joining our Telegram channel.</string>
+    <string name="join_channel">Join Telegram Channel</string>
+    <string name="later">Later</string>
+
+    <!-- Network -->
+    <string name="poor_network_warning">Poor network detected — enabling low-bandwidth mode</string>
+
+    <!-- Settings -->
+    <string name="settings">Settings</string>
+    <string name="appearance">Appearance</string>
+    <string name="dark_mode">Dark Mode</string>
+    <string name="dark">Dark</string>
+    <string name="light">Light</string>
+    <string name="theme">Theme</string>
+    <string name="theme_space">Deep Space</string>
+    <string name="theme_nebula">Nebula</string>
+    <string name="theme_aurora">Aurora</string>
+    <string name="language">Language</string>
+    <string name="lang_system">System Default</string>
+
+    <string name="cursor_input">Cursor &amp; Input</string>
+    <string name="cursor_style">Cursor Style</string>
+    <string name="cursor_default">Default Arrow</string>
+    <string name="cursor_crosshair">Crosshair</string>
+    <string name="cursor_dot">Dot</string>
+    <string name="cursor_circle">Circle</string>
+    <string name="cursor_size">Cursor Size</string>
+    <string name="touchpad_sensitivity">Touchpad Sensitivity</string>
+    <string name="haptic_feedback">Haptic Feedback</string>
+    <string name="sound_effects">Sound Effects</string>
+    <string name="sound_effects_desc">Play short sounds for taps, toggles, and connection events</string>
+
+    <string name="connection">Connection</string>
+    <string name="auto_reconnect">Auto Reconnect</string>
+    <string name="compression_quality">Compression Quality</string>
+    <string name="default_resolution">Default Display Resolution</string>
+    <string name="run_in_background">Keep RDP Running in Background</string>
+    <string name="run_in_background_desc">Stay connected when you switch apps or lock the screen</string>
+
+    <string name="session_controls">In-Session Controls</string>
+    <string name="show_toolbar_by_default">Show Toolbar by Default</string>
+    <string name="show_extra_keys_by_default">Show Keyboard Shortcuts Bar</string>
+
+    <string name="developer">Developer</string>
+    <string name="developer_telegram">GoToHEX — Tap to open Telegram</string>
+    <string name="developer_youtube">@dev-hex404 — Tap to open YouTube</string>
+    <string name="about">About</string>
+    <string name="by_developer">by GoToHEX</string>
+
+    <!-- Background session -->
+    <string name="background_session_channel">Active RDP Sessions</string>
+    <string name="background_session_title">HexRDP session active</string>
+    <string name="background_session_text">Connected to %1$s — tap to return</string>
+</resources>

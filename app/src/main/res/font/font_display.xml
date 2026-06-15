@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    "Orbitron" — geometric, sci-fi display font used for headings/titles
+    throughout the app (issue #7).
+
+    PLACEHOLDER FONT FILES:
+    The .ttf files currently in res/font/ are minimal placeholders (they only
+    contain a glyph for "A" and space) so the project builds successfully out
+    of the box. Replace them with the real font files using the EXACT SAME
+    FILENAMES and Compose/the system will pick them up automatically — no
+    code changes needed.
+
+    Download (OFL licensed):
+      https://fonts.google.com/specimen/Orbitron
+    Files to replace:
+      res/font/orbitron_medium.ttf    <- Orbitron Medium   (weight 500)
+      res/font/orbitron_semibold.ttf  <- Orbitron SemiBold (weight 600)
+      res/font/orbitron_bold.ttf      <- Orbitron Bold     (weight 700)
+-->
+<font-family xmlns:android="http://schemas.android.com/apk/res/android">
+    <font
+        android:fontStyle="normal"
+        android:fontWeight="500"
+        android:font="@font/orbitron_medium" />
+    <font
+        android:fontStyle="normal"
+        android:fontWeight="600"
+        android:font="@font/orbitron_semibold" />
+    <font
+        android:fontStyle="normal"
+        android:fontWeight="700"
+        android:font="@font/orbitron_bold" />
+</font-family>
