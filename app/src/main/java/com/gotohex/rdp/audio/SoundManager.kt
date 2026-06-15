@@ -48,10 +48,6 @@ class SoundManager @Inject constructor(
         Sound.CONNECT to soundPool.load(context, R.raw.sfx_connect, 1),
     )
 
-    fun setEnabled(value: Boolean) {
-        enabled = value
-    }
-
     /** Plays [sound] at [volume] (0f..1f) if sound effects are enabled. */
     fun play(sound: Sound, volume: Float = 0.5f) {
         if (!enabled) return
