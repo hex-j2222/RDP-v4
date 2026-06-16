@@ -51,7 +51,21 @@ class RdpSessionService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val profileName = intent?.getStringExtra(EXTRA_PROFILE_NAME) ?: "RDP"
-        startForeground(NOTIFICATION_ID, buildNotification(profileName))
+        val notification = buildNotification(profileName)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Must match the android:foregroundServiceType="connectedDevice"
+            // declared for this service in the manifest. On API 34+, omitting
+            // this throws MissingForegroundServiceTypeException /
+            // ForegroundServiceTypeNotAllowedException and crashes the app
+            // the moment a session tries to go to the background.
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
         return START_STICKY
     }
 
