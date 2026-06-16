@@ -3,6 +3,7 @@ package com.gotohex.rdp.rdp.protocol
 import android.util.Log
 import com.gotohex.rdp.data.model.RdpCredentials
 import com.gotohex.rdp.data.model.RdpPerformance
+import com.gotohex.rdp.rdp.codec.RdpBitmapDecoder
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import java.io.*
