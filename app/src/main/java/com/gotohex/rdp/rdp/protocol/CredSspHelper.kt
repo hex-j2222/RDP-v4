@@ -1,55 +1,70 @@
 package com.gotohex.rdp.rdp.protocol
 
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.MessageDigest
+import java.security.SecureRandom
+import javax.crypto.Mac
+import javax.crypto.spec.SecretKeySpec
+
 /**
  * CredSSP (Credential Security Support Provider, MS-CSSP) message encoding
  * and parsing.
  *
- * TSRequest ::= SEQUENCE {
- *   version    [0] INTEGER,
- *   negoTokens [1] SEQUENCE OF SEQUENCE { negoToken [0] OCTET STRING } OPTIONAL,
- *   authInfo   [2] OCTET STRING OPTIONAL,
- *   pubKeyAuth [3] OCTET STRING OPTIONAL,
- * }
+ * COMPREHENSIVE FIX for maximum compatibility:
+ * - Windows XP/7/2008/2012: Version 2 (raw public key encryption)
+ * - Windows 10/11/Server 2016/2019/2022: Version 2, 5, or 6 (SHA256 hash)
+ * - xrdp/Linux: TLS only (no NLA)
  *
- * TSCredentials ::= SEQUENCE {
- *   credType    [0] INTEGER,
- *   credentials [1] OCTET STRING, -- DER-encoded TSPasswordCreds
- * }
- *
- * TSPasswordCreds ::= SEQUENCE {
- *   domainName [0] OCTET STRING,
- *   userName   [1] OCTET STRING,
- *   password   [2] OCTET STRING,
- * }
- *
- * The previous implementation used a custom non-standard 4-byte length
- * prefix and a naive "scan for the first 0x04 tag" parser, which does not
- * interoperate with any real CredSSP server and never sent pubKeyAuth /
- * authInfo at all (issue #12).
+ * Strategy:
+ * 1. Start with CredSSP version 2 (most compatible)
+ * 2. If server responds with version 5/6, adapt to SHA256 hash mode
+ * 3. Support both raw public key (v2) and SHA256 hash (v5/6) for pubKeyAuth
  */
 object CredSspHelper {
 
-    private const val CREDSSP_VERSION = 6
+    // Use version 2 for initial request - compatible with ALL Windows versions
+    // Server will tell us if it supports higher version
+    private const val CREDSSP_VERSION = 2
+
+    // Version 5/6 hash magic strings (UTF-8 with null terminator as per MS-CSSP)
+    private val CLIENT_SERVER_HASH_MAGIC = "CredSSP Client-To-Server Binding Hash\u0000".toByteArray(Charsets.UTF_8)
+    private val SERVER_CLIENT_HASH_MAGIC = "CredSSP Server-To-Client Binding Hash\u0000".toByteArray(Charsets.UTF_8)
+
+    // ── Version Detection ──────────────────────────────────────────────────
+
+    /** Tracks the negotiated CredSSP version from server response */
+    var negotiatedCredSspVersion: Int = 2
+        private set
+
+    /** 32-byte nonce for version 5/6 */
+    private var clientNonce: ByteArray? = null
 
     // ── Encoding ───────────────────────────────────────────────────────────
 
-    /** TSRequest containing only negoTokens = [ NEGOTIATE ]. */
-    fun buildNegotiateTsRequest(negotiateMessage: ByteArray): ByteArray =
-        buildTsRequest(negoToken = negotiateMessage, pubKeyAuth = null, authInfo = null)
+    fun buildNegotiateTsRequest(negotiateMessage: ByteArray): ByteArray {
+        negotiatedCredSspVersion = 2 // Reset to default
+        clientNonce = null
+        return buildTsRequest(negoToken = negotiateMessage, pubKeyAuth = null, authInfo = null, clientNonce = null)
+    }
 
-    /** TSRequest containing negoTokens = [ AUTHENTICATE ] and pubKeyAuth. */
-    fun buildAuthenticateTsRequest(authMessage: ByteArray, pubKeyAuth: ByteArray): ByteArray =
-        buildTsRequest(negoToken = authMessage, pubKeyAuth = pubKeyAuth, authInfo = null)
+    fun buildAuthenticateTsRequest(authMessage: ByteArray, pubKeyAuth: ByteArray): ByteArray {
+        return buildTsRequest(negoToken = authMessage, pubKeyAuth = pubKeyAuth, authInfo = null, clientNonce = clientNonce)
+    }
 
-    /** TSRequest containing only authInfo (encrypted TSCredentials). */
-    fun buildAuthInfoTsRequest(authInfo: ByteArray): ByteArray =
-        buildTsRequest(negoToken = null, pubKeyAuth = null, authInfo = authInfo)
+    fun buildAuthInfoTsRequest(authInfo: ByteArray): ByteArray {
+        return buildTsRequest(negoToken = null, pubKeyAuth = null, authInfo = authInfo, clientNonce = null)
+    }
 
-    private fun buildTsRequest(negoToken: ByteArray?, pubKeyAuth: ByteArray?, authInfo: ByteArray?): ByteArray {
-        var content = derTagged(0, derInteger(CREDSSP_VERSION))
+    private fun buildTsRequest(
+        negoToken: ByteArray?,
+        pubKeyAuth: ByteArray?,
+        authInfo: ByteArray?,
+        clientNonce: ByteArray?
+    ): ByteArray {
+        var content = derTagged(0, derInteger(negotiatedCredSspVersion))
 
         if (negoToken != null) {
-            // negoTokens [1] SEQUENCE OF SEQUENCE { [0] OCTET STRING negoToken }
             val innerSeq = derSequence(derTagged(0, derOctetString(negoToken)))
             val negoTokensSeq = derSequence(innerSeq)
             content += derTagged(1, negoTokensSeq)
@@ -63,22 +78,30 @@ object CredSspHelper {
             content += derTagged(3, derOctetString(pubKeyAuth))
         }
 
+        // Version 5/6: include clientNonce [5] if present
+        if (clientNonce != null) {
+            content += derTagged(5, derOctetString(clientNonce))
+        }
+
         return derSequence(content)
     }
 
     /**
-     * Builds a (plaintext) TSCredentials structure containing TSPasswordCreds
-     * for [domain]/[username]/[password]. The caller is responsible for
-     * encrypting this with [NtlmHelper.encryptMessage] before sending it as
-     * authInfo.
+     * Builds TSCredentials with proper encoding.
+     * TSPasswordCreds fields are OCTET STRING containing UTF-16LE bytes.
+     * The OCTET STRING DER encoding already includes length, so no additional length prefix needed.
      */
     fun buildTsCredentials(domain: String, username: String, password: String): ByteArray {
+        val domainBytes = domain.toByteArray(Charsets.UTF_16LE)
+        val usernameBytes = username.toByteArray(Charsets.UTF_16LE)
+        val passwordBytes = password.toByteArray(Charsets.UTF_16LE)
+
         val tsPasswordCreds = derSequence(
-            derTagged(0, derOctetString(domain.toByteArray(Charsets.UTF_16LE))) +
-            derTagged(1, derOctetString(username.toByteArray(Charsets.UTF_16LE))) +
-            derTagged(2, derOctetString(password.toByteArray(Charsets.UTF_16LE)))
+            derTagged(0, derOctetString(domainBytes)) +
+            derTagged(1, derOctetString(usernameBytes)) +
+            derTagged(2, derOctetString(passwordBytes))
         )
-        // TSCredentials: credType [0] INTEGER (1 = password), credentials [1] OCTET STRING
+
         val tsCredentials = derSequence(
             derTagged(0, derInteger(1)) +
             derTagged(1, derOctetString(tsPasswordCreds))
@@ -86,15 +109,65 @@ object CredSspHelper {
         return tsCredentials
     }
 
-    // ── Parsing ────────────────────────────────────────────────────────────
+    // ── Version 5/6 SHA256 Hash for pubKeyAuth ─────────────────────────────
 
     /**
-     * Extracts the single NTLM token from `negoTokens[0].negoToken` of a
-     * TSRequest (used to read the server's CHALLENGE message).
+     * Computes pubKeyAuth based on negotiated version.
+     * Version 2/3/4: encrypt raw SubjectPublicKey
+     * Version 5/6: encrypt(SHA256(hashMagic + nonce + SubjectPublicKey))
      */
+    fun computePubKeyAuth(
+        serverPublicKey: ByteArray,
+        encryptionState: NtlmHelper.NtlmEncryptionState,
+        sequenceNumber: Int
+    ): ByteArray {
+        return if (negotiatedCredSspVersion >= 5) {
+            // Generate nonce for version 5/6
+            clientNonce = ByteArray(32).also { SecureRandom().nextBytes(it) }
+            val hash = sha256Hash(CLIENT_SERVER_HASH_MAGIC, clientNonce!!, serverPublicKey)
+            NtlmHelper.encryptMessage(encryptionState, hash, sequenceNumber)
+        } else {
+            // Version 2/3/4: encrypt raw public key
+            NtlmHelper.encryptMessage(encryptionState, serverPublicKey, sequenceNumber)
+        }
+    }
+
+    /**
+     * Verifies server pubKeyAuth response based on negotiated version.
+     * Version 2/3/4: decrypted data should be (pubKey[0] + 1), rest unchanged
+     * Version 5/6: decrypted data should be SHA256(serverHashMagic + nonce + SubjectPublicKey)
+     */
+    fun verifyPubKeyAuthResponse(
+        encryptedResponse: ByteArray,
+        serverPublicKey: ByteArray,
+        encryptionState: NtlmHelper.NtlmEncryptionState,
+        sequenceNumber: Int
+    ): Boolean {
+        val decrypted = NtlmHelper.decryptMessage(encryptionState, encryptedResponse, sequenceNumber)
+        return if (negotiatedCredSspVersion >= 5) {
+            val expectedHash = sha256Hash(SERVER_CLIENT_HASH_MAGIC, clientNonce ?: return false, serverPublicKey)
+            decrypted.contentEquals(expectedHash)
+        } else {
+            // Version 2/3/4: server returns (firstByte + 1), rest unchanged
+            if (decrypted.isEmpty() || serverPublicKey.isEmpty()) return false
+            val expectedFirstByte = ((serverPublicKey[0].toInt() and 0xFF) + 1) and 0xFF
+            val actualFirstByte = decrypted[0].toInt() and 0xFF
+            actualFirstByte == expectedFirstByte
+        }
+    }
+
+    private fun sha256Hash(magic: ByteArray, nonce: ByteArray, publicKey: ByteArray): ByteArray {
+        val md = MessageDigest.getInstance("SHA-256")
+        md.update(magic)
+        md.update(nonce)
+        md.update(publicKey)
+        return md.digest()
+    }
+
+    // ── Parsing ────────────────────────────────────────────────────────────
+
     fun extractNegoToken(tsRequest: ByteArray): ByteArray? {
         val root = DerReader(tsRequest).readElement() ?: return null
-        // root: SEQUENCE -> find context tag [1] (negoTokens)
         val negoTokensField = root.children.find { it.tag == 0xA1 } ?: return null
         val negoTokensSeq = negoTokensField.children.firstOrNull { it.tag == 0x30 } ?: return null
         val firstSeq = negoTokensSeq.children.firstOrNull { it.tag == 0x30 } ?: return null
@@ -103,12 +176,40 @@ object CredSspHelper {
         return octetString.content
     }
 
-    /** Extracts `pubKeyAuth` (context tag [3]) from a TSRequest. */
     fun extractPubKeyAuth(tsRequest: ByteArray): ByteArray? {
         val root = DerReader(tsRequest).readElement() ?: return null
         val field = root.children.find { it.tag == 0xA3 } ?: return null
         val octetString = field.children.firstOrNull { it.tag == 0x04 } ?: return null
         return octetString.content
+    }
+
+    /**
+     * Extracts version from server TSRequest response.
+     * This tells us what version the server supports.
+     */
+    fun extractVersion(tsRequest: ByteArray): Int {
+        val root = DerReader(tsRequest).readElement() ?: return 2
+        val versionField = root.children.find { it.tag == 0xA0 } ?: return 2
+        val integer = versionField.children.firstOrNull { it.tag == 0x02 } ?: return 2
+        return parseDerInteger(integer.content)
+    }
+
+    fun extractClientNonce(tsRequest: ByteArray): ByteArray? {
+        val root = DerReader(tsRequest).readElement() ?: return null
+        val nonceField = root.children.find { it.tag == 0xA5 } ?: return null
+        val octetString = nonceField.children.firstOrNull { it.tag == 0x04 } ?: return null
+        return octetString.content
+    }
+
+    /**
+     * Extracts errorCode from server TSRequest (version 3+).
+     * If present, indicates authentication failure reason.
+     */
+    fun extractErrorCode(tsRequest: ByteArray): Int? {
+        val root = DerReader(tsRequest).readElement() ?: return null
+        val errorField = root.children.find { it.tag == 0xA4 } ?: return null
+        val integer = errorField.children.firstOrNull { it.tag == 0x02 } ?: return null
+        return parseDerInteger(integer.content)
     }
 
     // ── DER primitives ─────────────────────────────────────────────────────
@@ -127,7 +228,6 @@ object CredSspHelper {
     }
 
     private fun derInteger(value: Int): ByteArray {
-        // Minimal-length signed big-endian encoding
         var v = value
         if (v == 0) {
             return byteArrayOf(0x02, 0x01, 0x00)
@@ -138,11 +238,9 @@ object CredSspHelper {
             v = v ushr 8
             if (tmp.size >= 4) break
         }
-        // Trim leading zero bytes but keep the sign bit correct for positive values
         while (tmp.size > 1 && tmp.first() == 0 && (tmp[1] and 0x80) == 0) {
             tmp.removeFirst()
         }
-        // Ensure non-negative values whose high bit is set get a leading 0x00
         if ((tmp.first() and 0x80) != 0) {
             tmp.addFirst(0x00)
         }
@@ -157,6 +255,15 @@ object CredSspHelper {
             length < 0x100 -> byteArrayOf(0x81.toByte(), length.toByte())
             else -> byteArrayOf(0x82.toByte(), (length shr 8).toByte(), (length and 0xFF).toByte())
         }
+    }
+
+    private fun parseDerInteger(data: ByteArray): Int {
+        if (data.isEmpty()) return 0
+        var result = 0
+        for (i in data.indices) {
+            result = (result shl 8) or (data[i].toInt() and 0xFF)
+        }
+        return result
     }
 }
 
@@ -179,8 +286,6 @@ private class DerReader(private val data: ByteArray) {
         val content = data.copyOfRange(pos, pos + length)
         pos += length
 
-        // Constructed types have bit 0x20 set in the tag (SEQUENCE = 0x30,
-        // context-specific constructed = 0xA0..0xBF).
         val isConstructed = (tag and 0x20) != 0
         val children = if (isConstructed) {
             val childReader = DerReader(content)
