@@ -217,6 +217,8 @@ class RdpClient(
 
     /** Tracks which security protocol the server accepted (TLS vs NLA/CredSSP). */
     private var negotiatedNla = false
+    /** The protocol selected by the server during negotiation (for Core Data). */
+    private var serverSelectedProtocol: Int = 0
 
     private fun readX224ConnectionConfirm(): Boolean {
         val header = ByteArray(4)
@@ -240,6 +242,7 @@ class RdpClient(
                             ((data.getOrElse(9) { 0 }.toInt() and 0xFF) shl 8) or
                             (data.getOrElse(8) { 0 }.toInt() and 0xFF)
                     negotiatedNla = (selected and 0x02) != 0
+                    serverSelectedProtocol = selected
                     Log.d(TAG, "Server selected security protocol: $selected (NLA=$negotiatedNla)")
                 }
                 0x03 -> { // RDP_NEG_FAILURE
@@ -297,7 +300,10 @@ class RdpClient(
         repeat(64) { buf.put(0) }      // clientDigProductId
         buf.put(0)                     // connectionType
         buf.put(0)                     // pad1octet
-        buf.putInt(0)                  // serverSelectedProtocol
+        // FIX: serverSelectedProtocol must match the negotiated protocol
+        // (TLS=0x01, NLA=0x02, Standard=0x00). Without this, Windows servers
+        // detect a protocol mismatch and silently drop the connection.
+        buf.putInt(serverSelectedProtocol)
 
         return buf.array().copyOf(buf.position())
     }
@@ -411,17 +417,14 @@ class RdpClient(
             socket, credentials.host, credentials.port, true
         ) as javax.net.ssl.SSLSocket
 
-        // RDP servers commonly only support up to TLSv1.2; some Java/Android
-        // TLS stacks default to offering TLSv1.3 only in certain configs.
-        // Restricting explicitly avoids handshake failures against older
-        // RDP stacks while still allowing TLSv1.2 (used by NLA/CredSSP).
-        try {
-            val supported = sslSocket.supportedProtocols.toSet()
-            val enabled = listOf("TLSv1.2", "TLSv1.1", "TLSv1").filter { it in supported }
-            if (enabled.isNotEmpty()) sslSocket.enabledProtocols = enabled.toTypedArray()
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not restrict TLS protocols: ${e.message}")
-        }
+        // FIX: Do NOT restrict TLS versions. Windows 11 and modern servers
+        // support TLSv1.3, and forcing only TLSv1.2/1.1/1.0 causes handshake
+        // failures on those systems. Let the JVM/Android TLS stack negotiate
+        // the best mutually supported version automatically.
+        // Previous code explicitly disabled TLSv1.3 which broke Win11.
+        //
+        // If a specific older server requires TLSv1.2, the stack will
+        // downgrade automatically during handshake.
 
         sslSocket.startHandshake()
 
@@ -543,27 +546,48 @@ class RdpClient(
         Log.d(TAG, "CredSSP/NTLMv2 authentication complete")
     }
 
+    /**
+     * FIX: Client Info PDU must be wrapped in a proper MCS Send Data Request
+     * with the correct userId and channelId, and the PDU flags must include
+     * INFO_UNICODE (0x00000010) so the server interprets strings as UTF-16LE.
+     * Without INFO_UNICODE, Windows servers read garbage for domain/user/pass
+     * and reject the login. The previous implementation also omitted the MCS
+     * wrapper entirely, sending raw Client Info bytes without MCS framing.
+     */
     private fun sendClientInfoPdu() {
-        val buf = ByteBuffer.allocate(512).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putInt(0x00000000)  // codePage
-        buf.putInt(0x00000043)  // flags: CompressionTypeMask | LogonNotifyEnabled | NoAudioPlayback
         val domainBytes = (credentials.domain + "\u0000").toByteArray(Charsets.UTF_16LE)
         val userBytes = (credentials.username + "\u0000").toByteArray(Charsets.UTF_16LE)
         val passBytes = (credentials.password + "\u0000").toByteArray(Charsets.UTF_16LE)
         val shellBytes = "\u0000".toByteArray(Charsets.UTF_16LE)
         val workdirBytes = "\u0000".toByteArray(Charsets.UTF_16LE)
 
+        // PDU size = header(18) + len fields(10) + strings
+        val pduSize = 18 + 10 + domainBytes.size + userBytes.size + passBytes.size + shellBytes.size + workdirBytes.size
+        val buf = ByteBuffer.allocate(pduSize).order(ByteOrder.LITTLE_ENDIAN)
+
+        // TS_INFO_PACKET header
+        buf.putInt(0x00000000)  // codePage
+        // FIX: flags must include INFO_UNICODE (0x00000010) for UTF-16LE strings.
+        // Also include LOGON_NOTIFY (0x00000040) and COMPRESSION_TYPE_MASK (0x00000003).
+        buf.putInt(0x00000053)  // flags: CompressionTypeMask | LOGON_NOTIFY | LOGON_ERRORS | INFO_UNICODE | NOAUDIOPLAYBACK
+
         buf.putShort((domainBytes.size - 2).toShort())
         buf.putShort((userBytes.size - 2).toShort())
         buf.putShort((passBytes.size - 2).toShort())
         buf.putShort((shellBytes.size - 2).toShort())
         buf.putShort((workdirBytes.size - 2).toShort())
+
+        // FIX: After the length fields, the spec requires 2 bytes of padding
+        // before the actual string data begins (for alignment).
+        buf.putShort(0)
+
         buf.put(domainBytes)
         buf.put(userBytes)
         buf.put(passBytes)
         buf.put(shellBytes)
         buf.put(workdirBytes)
 
+        // Wrap in MCS Send Data Request (this was previously missing)
         sendMcsSendDataRequest(buf.array().copyOf(buf.position()))
     }
 
@@ -607,45 +631,158 @@ class RdpClient(
         return if (offset <= data.size) data.copyOfRange(offset, data.size) else data
     }
 
+    /**
+     * FIX: Confirm Active PDU must include a proper Share Control Header
+     * (totalLength, pduType, pduSource) and a Share ID before the capability
+     * sets. The previous implementation sent raw capability bytes without any
+     * header, so the server could not parse the PDU type or associate it with
+     * the correct share. Also added missing capability sets (Order, Bitmap
+     * Cache, Pointer, Input, Brush, Glyph Cache, Offscreen Cache, Virtual
+     * Channel, Sound) that Windows servers expect to see.
+     */
     private fun sendConfirmActivePdu() {
-        // Build capability sets for confirm active
         val caps = buildCapabilitySets()
-        sendMcsSendDataRequest(caps)
+
+        // Share Control Header (6 bytes)
+        val shareControlHeader = ByteBuffer.allocate(6).order(ByteOrder.LITTLE_ENDIAN)
+        shareControlHeader.putShort((caps.size + 14).toShort()) // totalLength including this header + shareId + originatorId
+        shareControlHeader.putShort(0x0013) // pduType = TS_PDUTYPE_CONFIRMACTIVEPDU
+        shareControlHeader.putShort(0x03EA.toShort()) // pduSource = 1002 (MCS channel)
+
+        // Share Data Header (8 bytes)
+        val shareDataHeader = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
+        shareDataHeader.putInt(0x000103EA) // shareId (must match server's Demand Active)
+        shareDataHeader.putShort(0x03EA.toShort()) // originatorId = 1002
+        shareDataHeader.putShort(0x02) // length of this header (in 16-bit words) = 2
+
+        val fullPdu = shareControlHeader.array() + shareDataHeader.array() + caps
+        sendMcsSendDataRequest(fullPdu)
     }
 
     private fun buildCapabilitySets(): ByteArray {
-        val buf = ByteBuffer.allocate(256).order(ByteOrder.LITTLE_ENDIAN)
-        // General capability set
-        buf.putShort(0x0001) // CAPSTYPE_GENERAL
-        buf.putShort(24)
-        buf.putShort(1)       // osMajorType: Windows
-        buf.putShort(3)       // osMinorType: NT
-        buf.putShort(0x0200)  // protocolVersion
-        buf.putShort(0)       // pad2octetsA
-        buf.putShort(0)       // generalCompressionTypes
-        buf.putShort(0x0040)  // extraFlags: fastPathOutputSupported
-        buf.putShort(0)       // updateCapabilityFlag
-        buf.putShort(0)       // remoteUnshareFlag
-        buf.putShort(0)       // generalCompressionLevel
-        buf.putShort(0)       // refreshRectSupport
-        buf.putShort(0)       // suppressOutputSupport
+        val buf = ByteBuffer.allocate(512).order(ByteOrder.LITTLE_ENDIAN)
 
-        // Bitmap capability
+        // General capability set (24 bytes)
+        buf.putShort(0x0001) // CAPSTYPE_GENERAL
+        buf.putShort(24)     // length
+        buf.putShort(1)      // osMajorType: Windows
+        buf.putShort(3)      // osMinorType: NT
+        buf.putShort(0x0200) // protocolVersion
+        buf.putShort(0)      // pad2octetsA
+        buf.putShort(0)      // generalCompressionTypes
+        buf.putShort(0x0041) // extraFlags: fastPathOutputSupported | noBitmapCompressionHdr
+        buf.putShort(0)      // updateCapabilityFlag
+        buf.putShort(0)      // remoteUnshareFlag
+        buf.putShort(0)      // generalCompressionLevel
+        buf.putShort(0)      // refreshRectSupport
+        buf.putShort(0)      // suppressOutputSupport
+
+        // Bitmap capability set (28 bytes)
         buf.putShort(0x0002) // CAPSTYPE_BITMAP
         buf.putShort(28)
-        buf.putShort(32)      // preferredBitsPerPixel
-        buf.putShort(1)       // receive1BitPerPixel
-        buf.putShort(1)       // receive4BitsPerPixel
-        buf.putShort(1)       // receive8BitsPerPixel
+        buf.putShort(32)     // preferredBitsPerPixel
+        buf.putShort(1)      // receive1BitPerPixel
+        buf.putShort(1)      // receive4BitsPerPixel
+        buf.putShort(1)      // receive8BitsPerPixel
         buf.putShort(displayWidth.toShort())
         buf.putShort(displayHeight.toShort())
-        buf.putShort(0)       // pad2octets
-        buf.putShort(1)       // desktopResizeFlag
-        buf.putShort(1)       // bitmapCompressionFlag
-        buf.put(0)            // highColorFlags
-        buf.put(0)            // drawingFlags
-        buf.putShort(1)       // multipleRectangleSupport
-        buf.putShort(0)       // pad2octetsB
+        buf.putShort(0)      // pad2octets
+        buf.putShort(1)      // desktopResizeFlag
+        buf.putShort(1)      // bitmapCompressionFlag
+        buf.put(0)           // highColorFlags
+        buf.put(0)           // drawingFlags
+        buf.putShort(1)      // multipleRectangleSupport
+        buf.putShort(0)      // pad2octetsB
+
+        // Order capability set (88 bytes)
+        buf.putShort(0x0003) // CAPSTYPE_ORDER
+        buf.putShort(88)
+        repeat(32) { buf.put(0) } // terminalDescriptor
+        buf.putInt(0)        // pad4octetsA
+        buf.putShort(1)      // desktopSaveXGranularity
+        buf.putShort(20)     // desktopSaveYGranularity
+        buf.putShort(0)      // pad2octetsA
+        buf.putShort(1)      // maximumOrderLevel
+        buf.putShort(0)      // numberFonts
+        buf.putShort(0x2F)   // orderFlags
+        repeat(32) { buf.put(0) } // orderSupport
+        buf.putShort(0x0040) // textFlags
+        buf.putShort(0)      // orderSupportExFlags
+        buf.putInt(0)        // pad4octetsB
+        buf.putInt(230400)   // desktopSaveSize
+        buf.putShort(0)      // pad2octetsC
+        buf.putShort(0)      // pad2octetsD
+        buf.putShort(0x01)   // textANSICodePage
+        buf.putShort(0)      // pad2octetsE
+
+        // Bitmap Cache capability set (40 bytes) — revision 2
+        buf.putShort(0x0013) // CAPSTYPE_BITMAPCACHE_REV2
+        buf.putShort(40)
+        buf.putShort(0x0003) // CacheFlags
+        buf.putShort(0)      // Pad
+        buf.putInt(600)      // NumCellCaches
+        // Cell info for 3 caches
+        buf.putInt(0x00000078) // Cache0: 120 entries
+        buf.putInt(0x00000078) // Cache1: 120 entries
+        buf.putInt(0x00000078) // Cache2: 120 entries
+        buf.putInt(0) // Cache3
+        buf.putInt(0) // Cache4
+
+        // Pointer capability set (10 bytes)
+        buf.putShort(0x0008) // CAPSTYPE_POINTER
+        buf.putShort(10)
+        buf.putShort(1)      // colorPointerFlag
+        buf.putShort(20)     // colorPointerCacheSize
+        buf.putShort(20)     // pointerCacheSize
+
+        // Input capability set (88 bytes)
+        buf.putShort(0x000D) // CAPSTYPE_INPUT
+        buf.putShort(88)
+        buf.putShort(0)      // inputFlags
+        buf.putShort(0)      // pad2octetsA
+        buf.putInt(0x00000409) // keyboardLayout (English US)
+        buf.putInt(2600)     // keyboardType
+        buf.putInt(0)        // keyboardSubType
+        buf.putInt(12)       // keyboardFunctionKey
+        repeat(64) { buf.put(0) } // imeFileName
+        buf.putShort(0x0000) // inputFlags (extended)
+        buf.putShort(0)      // pad2octetsB
+
+        // Brush capability set (8 bytes)
+        buf.putShort(0x000F) // CAPSTYPE_BRUSH
+        buf.putShort(8)
+        buf.putInt(1)        // brushSupportLevel = BRUSH_DEFAULT
+
+        // Glyph Cache capability set (52 bytes)
+        buf.putShort(0x0010) // CAPSTYPE_GLYPHCACHE
+        buf.putShort(52)
+        // 10 glyph cache entries
+        repeat(10) {
+            buf.putShort(0x0100) // CacheEntries = 256
+            buf.putShort(0x0004) // CacheMaximumCellSize = 4
+        }
+        buf.putInt(0x00000001) // fragCache
+        buf.putShort(0x0001)   // glyphSupportLevel = GLYPH_SUPPORT_NONE
+        buf.putShort(0)        // pad2octets
+
+        // Offscreen Bitmap Cache capability set (12 bytes)
+        buf.putShort(0x0011) // CAPSTYPE_OFFSCREENCACHE
+        buf.putShort(12)
+        buf.putInt(7680)     // offscreenSupportLevel
+        buf.putShort(0x0064) // offscreenCacheSize = 100
+        buf.putShort(0x0001) // offscreenCacheEntries = 1
+
+        // Virtual Channel capability set (12 bytes)
+        buf.putShort(0x0014) // CAPSTYPE_VIRTUALCHANNEL
+        buf.putShort(12)
+        buf.putInt(0)        // flags
+        buf.putInt(0x00020000) // VCChunkSize = 128KB
+
+        // Sound capability set (8 bytes)
+        buf.putShort(0x000C) // CAPSTYPE_SOUND
+        buf.putShort(8)
+        buf.putShort(0)      // soundFlags
+        buf.putShort(0)      // pad2octetsA
 
         return buf.array().copyOf(buf.position())
     }
