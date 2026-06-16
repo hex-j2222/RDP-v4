@@ -409,23 +409,35 @@ object NtlmHelper {
     /**
      * RC4 (ARC4) stream cipher (symmetric: same function encrypts and
      * decrypts). Stock Android's default crypto providers (AndroidOpenSSL /
-     * Conscrypt) do not expose RC4 via `Cipher.getInstance("RC4")` — but
-     * BouncyCastle (already a project dependency for TLS/NLA) does, under the
-     * algorithm name "ARC4". Falling back to the default provider name first
-     * keeps this portable to any JVM where "RC4"/"ARCFOUR" is registered.
+     * Conscrypt) do not register RC4/ARCFOUR at all, so calling
+     * `Cipher.getInstance("RC4")` or `Cipher.getInstance("ARC4")` without a
+     * provider always throws `NoSuchAlgorithmException` on Android — there is
+     * no working fallback through the default provider list. BouncyCastle
+     * (already a project dependency for TLS/NLA) does implement "ARC4", but
+     * only if requested with an explicit provider instance. Register
+     * BouncyCastle as a JCE Security Provider once (idempotent) and request
+     * the algorithm by provider name, which is portable and avoids
+     * allocating a new BouncyCastleProvider on every call.
      */
     private fun rc4(key: ByteArray, data: ByteArray): ByteArray {
-        val (cipher, keyAlgo) = try {
-            Cipher.getInstance("RC4") to "RC4"
-        } catch (_: java.security.NoSuchAlgorithmException) {
-            try {
-                Cipher.getInstance("ARC4") to "ARC4"
-            } catch (_: java.security.NoSuchAlgorithmException) {
-                Cipher.getInstance("ARC4", org.bouncycastle.jce.provider.BouncyCastleProvider()) to "ARC4"
-            }
-        }
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, keyAlgo))
+        ensureBouncyCastleRegistered()
+        val cipher = Cipher.getInstance("ARC4", "BC")
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "ARC4"))
         return cipher.doFinal(data)
+    }
+
+    @Volatile
+    private var bouncyCastleRegistered = false
+
+    private fun ensureBouncyCastleRegistered() {
+        if (bouncyCastleRegistered) return
+        synchronized(this) {
+            if (bouncyCastleRegistered) return
+            if (java.security.Security.getProvider("BC") == null) {
+                java.security.Security.addProvider(org.bouncycastle.jce.provider.BouncyCastleProvider())
+            }
+            bouncyCastleRegistered = true
+        }
     }
 }
 
