@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
 import com.gotohex.rdp.data.model.RdpPerformance
+import com.gotohex.rdp.rdp.protocol.RdpFrameUpdate
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
