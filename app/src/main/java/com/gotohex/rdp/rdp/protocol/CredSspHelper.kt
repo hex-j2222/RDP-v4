@@ -35,7 +35,6 @@ object CredSspHelper {
 
     /** Tracks the negotiated CredSSP version from server response */
     var negotiatedCredSspVersion: Int = 2
-        private set
 
     /** 32-byte nonce for version 5/6 */
     private var clientNonce: ByteArray? = null
@@ -234,7 +233,7 @@ object CredSspHelper {
         }
         val tmp = ArrayDeque<Int>()
         while (v != 0 || tmp.isEmpty()) {
-            tmp.addFirst(v and 0xFF)
+            tmp.addLast(v and 0xFF)
             v = v ushr 8
             if (tmp.size >= 4) break
         }
