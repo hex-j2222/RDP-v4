@@ -712,7 +712,7 @@ class RdpClient(
         // Process bitmap/graphics updates
         val decoder = RdpBitmapDecoder()
         val frames = decoder.decode(data, displayWidth, displayHeight, currentPerformance)
-        frames.forEach { frame ->
+        for (frame in frames) {
             _frameUpdates.emit(frame)
         }
     }
