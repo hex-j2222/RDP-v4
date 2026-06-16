@@ -379,18 +379,40 @@ object NtlmHelper {
         return mac.doFinal(blob)
     }
 
+    /**
+     * Builds the NTLMv2 response blob (MS-NLMP §2.2.2.7).
+     *
+     * FIX: The targetInfo from the server's CHALLENGE must be terminated with
+     * an MsvAvEOL AV_PAIR (type=0x0000, length=0x0000) before being placed in
+     * the blob. The server includes this terminator in its own targetInfo, but
+     * if it doesn't (or if we synthesize targetInfo), we must ensure it is
+     * present. Without the terminator, some NTLM implementations read past the
+     * end of the targetInfo and produce an incorrect NTProofStr, causing
+     * authentication to fail with STATUS_LOGON_FAILURE.
+     */
     private fun buildNtlmV2Blob(
         clientChallenge: ByteArray,
         timestamp: Long,
         targetInfo: ByteArray
     ): ByteArray {
-        val buf = ByteBuffer.allocate(28 + targetInfo.size).order(ByteOrder.LITTLE_ENDIAN)
+        // Ensure targetInfo ends with MsvAvEOL (0x0000 0x0000)
+        val terminatedTargetInfo = if (targetInfo.size >= 4 &&
+            (targetInfo[targetInfo.size - 4].toInt() and 0xFF) == 0x00 &&
+            (targetInfo[targetInfo.size - 3].toInt() and 0xFF) == 0x00 &&
+            (targetInfo[targetInfo.size - 2].toInt() and 0xFF) == 0x00 &&
+            (targetInfo[targetInfo.size - 1].toInt() and 0xFF) == 0x00) {
+            targetInfo // Already terminated
+        } else {
+            targetInfo + byteArrayOf(0x00, 0x00, 0x00, 0x00) // Append MsvAvEOL
+        }
+
+        val buf = ByteBuffer.allocate(28 + terminatedTargetInfo.size).order(ByteOrder.LITTLE_ENDIAN)
         buf.put(byteArrayOf(0x01, 0x01, 0x00, 0x00)) // Blob signature
         buf.putInt(0) // Reserved
         buf.putLong(timestamp)
         buf.put(clientChallenge)
         buf.putInt(0) // Reserved
-        buf.put(targetInfo)
+        buf.put(terminatedTargetInfo)
         return buf.array().copyOf(buf.position())
     }
 
