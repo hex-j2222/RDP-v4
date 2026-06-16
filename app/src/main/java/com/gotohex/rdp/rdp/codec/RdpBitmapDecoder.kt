@@ -1,4 +1,4 @@
-package com.gotohex.rdp.rdp.protocol
+package com.gotohex.rdp.rdp.codec
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
