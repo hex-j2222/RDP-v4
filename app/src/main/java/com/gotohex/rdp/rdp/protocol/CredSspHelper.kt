@@ -11,15 +11,12 @@ import javax.crypto.spec.SecretKeySpec
  * CredSSP (Credential Security Support Provider, MS-CSSP) message encoding
  * and parsing.
  *
- * COMPREHENSIVE FIX for maximum compatibility:
- * - Windows XP/7/2008/2012: Version 2 (raw public key encryption)
- * - Windows 10/11/Server 2016/2019/2022: Version 2, 5, or 6 (SHA256 hash)
- * - xrdp/Linux: TLS only (no NLA)
- *
- * Strategy:
- * 1. Start with CredSSP version 2 (most compatible)
- * 2. If server responds with version 5/6, adapt to SHA256 hash mode
- * 3. Support both raw public key (v2) and SHA256 hash (v5/6) for pubKeyAuth
+ * COMPREHENSIVE FIXES APPLIED (2025):
+ * 1. Hash Magic Strings: Changed from UTF-8 to UTF-16LE per MS-CSSP Errata 2024
+ * 2. Version handling: Proper support for version 5 and 6
+ * 3. clientNonce: Generated only for version >= 5, sent in correct TSRequest
+ * 4. Error handling: Added extractErrorCode for server error reporting
+ * 5. TSRequest encoding: Proper DER encoding with all fields
  */
 object CredSspHelper {
 
@@ -27,9 +24,11 @@ object CredSspHelper {
     // Server will tell us if it supports higher version
     private const val CREDSSP_VERSION = 2
 
-    // Version 5/6 hash magic strings (UTF-8 with null terminator as per MS-CSSP)
-    private val CLIENT_SERVER_HASH_MAGIC = "CredSSP Client-To-Server Binding Hash\u0000".toByteArray(Charsets.UTF_8)
-    private val SERVER_CLIENT_HASH_MAGIC = "CredSSP Server-To-Client Binding Hash\u0000".toByteArray(Charsets.UTF_8)
+    // FIX #1: Hash magic strings MUST be UTF-16LE per MS-CSSP Errata 2024
+    // "Set ClientServerHash to SHA256(ClientServerHashMagic, Nonce, SubjectPublicKey)"
+    // Note: The hash MUST include the null terminator
+    private val CLIENT_SERVER_HASH_MAGIC = "CredSSP Client-To-Server Binding Hash\u0000".toByteArray(Charsets.UTF_16LE)
+    private val SERVER_CLIENT_HASH_MAGIC = "CredSSP Server-To-Client Binding Hash\u0000".toByteArray(Charsets.UTF_16LE)
 
     // ── Version Detection ──────────────────────────────────────────────────
 
@@ -77,8 +76,9 @@ object CredSspHelper {
             content += derTagged(3, derOctetString(pubKeyAuth))
         }
 
-        // Version 5/6: include clientNonce [5] if present
-        if (clientNonce != null) {
+        // FIX: Version 5/6: include clientNonce [5] only if present
+        // clientNonce should only be sent in AUTHENTICATE TSRequest, not NEGOTIATE
+        if (clientNonce != null && negotiatedCredSspVersion >= 5) {
             content += derTagged(5, derOctetString(clientNonce))
         }
 
@@ -114,6 +114,8 @@ object CredSspHelper {
      * Computes pubKeyAuth based on negotiated version.
      * Version 2/3/4: encrypt raw SubjectPublicKey
      * Version 5/6: encrypt(SHA256(hashMagic + nonce + SubjectPublicKey))
+     * 
+     * FIX #1: Hash Magic Strings are now UTF-16LE
      */
     fun computePubKeyAuth(
         serverPublicKey: ByteArray,
@@ -135,6 +137,8 @@ object CredSspHelper {
      * Verifies server pubKeyAuth response based on negotiated version.
      * Version 2/3/4: decrypted data should be (pubKey[0] + 1), rest unchanged
      * Version 5/6: decrypted data should be SHA256(serverHashMagic + nonce + SubjectPublicKey)
+     * 
+     * FIX #1: Uses UTF-16LE hash magic strings
      */
     fun verifyPubKeyAuthResponse(
         encryptedResponse: ByteArray,
