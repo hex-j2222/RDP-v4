@@ -174,8 +174,8 @@ class RdpClient(
             RdpLog.d("RDP v5.2 connecting to ${credentials.host}:${credentials.port}")
 
             val sock = Socket()
-            sock.connect(InetSocketAddress(credentials.host, credentials.port), CONNECT_TIMEOUT_MS)
-            sock.soTimeout = READ_TIMEOUT_MS
+            sock.connect(InetSocketAddress(credentials.host, credentials.port), CONNECT_TIMEOUT_MS.toInt())
+            sock.soTimeout = READ_TIMEOUT_MS.toInt()
             sock.tcpNoDelay = true
             sock.setPerformancePreferences(0, 2, 1)
 
@@ -293,8 +293,8 @@ class RdpClient(
     private suspend fun connectWithoutNla(): Boolean {
         return try {
             val sock = Socket()
-            sock.connect(InetSocketAddress(credentials.host, credentials.port), CONNECT_TIMEOUT_MS)
-            sock.soTimeout = READ_TIMEOUT_MS
+            sock.connect(InetSocketAddress(credentials.host, credentials.port), CONNECT_TIMEOUT_MS.toInt())
+            sock.soTimeout = READ_TIMEOUT_MS.toInt()
             sock.tcpNoDelay = true
 
             socket = sock
@@ -1087,7 +1087,7 @@ class RdpClient(
                     _error.emit("Connection lost: ${e.message}")
                     break
                 }
-                delay(100 * consecutiveErrors)
+                delay((100 * consecutiveErrors).toLong())
             }
         }
         cleanup()
