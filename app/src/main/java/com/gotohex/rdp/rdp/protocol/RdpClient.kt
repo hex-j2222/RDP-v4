@@ -118,8 +118,24 @@ class RdpClient(
             }
             Log.d(TAG, "STEP 3: X.224 CC received (selected=$serverSelectedProtocol, NLA=$negotiatedNla, HybridEX=$negotiatedHybridEx)")
 
-            upgradeTls()
-            Log.d(TAG, "STEP 4: TLS upgraded")
+            // FIX: Previously upgradeTls() was called unconditionally, even
+            // when the server's RDP_NEG_RSP explicitly selected
+            // PROTOCOL_RDP (0x00) — Standard RDP Security, used by very old
+            // servers (Windows XP/2003) or servers explicitly configured for
+            // it. Forcing a TLS ClientHello onto a socket the peer expects to
+            // carry the legacy encrypted MCS handshake makes the server
+            // either hang until our read timeout or close the connection
+            // immediately, with no useful error. We now only upgrade when
+            // the server actually selected a TLS-based protocol, OR when no
+            // negotiation header was present at all (very old servers that
+            // predate RDP_NEG_REQ entirely also predate TLS, so in that case
+            // we must NOT upgrade either — handled by negotiationPresent).
+            if (negotiationPresent && serverSelectedProtocol != PROTOCOL_RDP) {
+                upgradeTls()
+                Log.d(TAG, "STEP 4: TLS upgraded")
+            } else {
+                Log.d(TAG, "STEP 4: Skipped TLS upgrade (server selected Standard RDP Security or pre-negotiation server)")
+            }
 
             // Handle Early User Authorization Result for Hybrid EX (Windows 8.1+)
             if (negotiatedHybridEx) {
@@ -135,9 +151,41 @@ class RdpClient(
                     Log.d(TAG, "STEP 5: NLA complete")
                 } catch (e: Exception) {
                     Log.w(TAG, "NLA failed: ${e.message}")
-                    if (allowFallback) {
-                        Log.w(TAG, "Fallback to Standard RDP Security not implemented in this version")
+
+                    // FIX: This fallback was previously a no-op (it only
+                    // logged a warning and then unconditionally re-threw,
+                    // regardless of allowFallback). A real fallback requires
+                    // tearing down the TLS/TCP connection and reconnecting
+                    // from scratch while re-requesting only PROTOCOL_RDP,
+                    // since the server already committed to NLA on this
+                    // socket and won't accept a bare MCS Connect Initial on
+                    // it. We only attempt this once, and only when the
+                    // failure looks like a negotiation/compatibility problem
+                    // rather than a confirmed bad-credentials error (in
+                    // which case retrying without NLA would not help and
+                    // would just waste a round trip and confuse the user).
+                    val looksLikeBadCredentials = e is RdpAuthException &&
+                        (e.message?.contains("LOGON_FAILURE") == true ||
+                         e.message?.contains("ACCOUNT_DISABLED") == true ||
+                         e.message?.contains("ACCOUNT_LOCKED_OUT") == true ||
+                         e.message?.contains("PASSWORD_EXPIRED") == true)
+
+                    if (allowFallback && !looksLikeBadCredentials) {
+                        Log.w(TAG, "Attempting fallback to Standard RDP Security (NLA disabled)")
+                        cleanup()
+                        val fellBack = connectWithoutNla()
+                        if (fellBack) {
+                            connected = true
+                            _sessionState.emit(RdpSessionState.CONNECTED)
+                            clientScope.launch { receiveLoop() }
+                            return@withContext true
+                        }
+                        throw RdpAuthException(
+                            "NLA authentication failed (${e.message}), and fallback to Standard RDP " +
+                            "Security also failed. Try disabling 'Use NLA Authentication' in the profile."
+                        )
                     }
+
                     throw RdpAuthException("NLA authentication failed (${e.message}). Try disabling 'Use NLA Authentication'.")
                 }
             }
@@ -182,12 +230,67 @@ class RdpClient(
     }
 
     /**
+     * FIX: Implements the fallback to Standard RDP Security (PROTOCOL_RDP)
+     * that was previously promised in the connect() comment but never
+     * written. Opens a fresh TCP connection (the original socket/TLS state
+     * from the failed NLA attempt cannot be reused) and re-runs the X.224
+     * negotiation requesting only PROTOCOL_RDP, skipping NLA/CredSSP
+     * entirely. Used for servers that advertise Hybrid/Hybrid-EX support in
+     * their RDP_NEG_RSP but then fail the actual CredSSP exchange (seen with
+     * some misconfigured or legacy third-party RDP servers).
+     */
+    private suspend fun connectWithoutNla(): Boolean {
+        return try {
+            val sock = Socket()
+            sock.connect(InetSocketAddress(credentials.host, credentials.port), CONNECT_TIMEOUT_MS)
+            sock.soTimeout = READ_TIMEOUT_MS
+            sock.tcpNoDelay = true
+
+            socket = sock
+            inputStream = DataInputStream(BufferedInputStream(sock.getInputStream(), 65536))
+            outputStream = DataOutputStream(BufferedOutputStream(sock.getOutputStream(), 65536))
+
+            forceStandardRdpSecurity = true
+            sendX224ConnectionRequest()
+
+            if (!readX224ConnectionConfirm()) return false
+
+            if (negotiationPresent && serverSelectedProtocol != PROTOCOL_RDP) {
+                // Server still insists on TLS even without NLA requested -
+                // that's fine, just upgrade and skip CredSSP.
+                upgradeTls()
+            }
+
+            sendMcsConnectInitial()
+            if (!readMcsConnectResponse()) return false
+            performMcsDomainSetup()
+            sendClientInfoPdu()
+            handleDemandActivePdu()
+            true
+        } catch (e: Exception) {
+            Log.w(TAG, "Fallback connection failed: ${e.message}")
+            false
+        }
+    }
+
+    /** Set when retrying via [connectWithoutNla] so the X.224 request never re-offers NLA. */
+    private var forceStandardRdpSecurity = false
+
+    /**
      * CRITICAL FIX: Request all protocols for maximum compatibility.
      * PROTOCOL_SSL | PROTOCOL_HYBRID | PROTOCOL_HYBRID_EX = 0x0B
      * Server will select the best it supports.
      *
      * WINDOWS 8/8.1: These systems support PROTOCOL_HYBRID_EX (0x08)
      * which provides enhanced security and performance.
+     *
+     * FIX: When forceStandardRdpSecurity is set (we are retrying after a
+     * failed NLA handshake via connectWithoutNla()), we must not re-offer
+     * PROTOCOL_HYBRID/PROTOCOL_HYBRID_EX — some servers always pick the
+     * highest protocol they support regardless of why we're reconnecting,
+     * which would just put us back in the same failing NLA path. We still
+     * offer PROTOCOL_SSL so a server that requires at least TLS isn't
+     * forced into a 0x00 standard-security PDU it might reject.
      */
     private fun sendX224ConnectionRequest() {
         val cookie = "Cookie: mstshash=user\r\n"
@@ -195,10 +298,10 @@ class RdpClient(
 
         // Request all protocols: TLS + NLA + Hybrid EX
         // Server will select what it supports
-        val requestedProtocols = if (credentials.useNla) {
-            PROTOCOL_SSL or PROTOCOL_HYBRID or PROTOCOL_HYBRID_EX
-        } else {
-            PROTOCOL_SSL
+        val requestedProtocols = when {
+            forceStandardRdpSecurity -> PROTOCOL_SSL
+            credentials.useNla -> PROTOCOL_SSL or PROTOCOL_HYBRID or PROTOCOL_HYBRID_EX
+            else -> PROTOCOL_SSL
         }
 
         val negReq = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
@@ -232,12 +335,29 @@ class RdpClient(
     private var negotiatedHybridEx = false
     private var serverSelectedProtocol: Int = 0
 
+    // FIX: Tracks whether the server actually sent an RDP_NEG_RSP/RDP_NEG_FAILURE
+    // structure at all. Ancient servers (Windows 2000/XP RTM-era RDP 4/5) reply
+    // to the X.224 Connection Request with a bare X.224 CC and no negotiation
+    // block whatsoever -- in that case serverSelectedProtocol stays at its
+    // default of 0 (PROTOCOL_RDP), but that 0 means "no negotiation happened"
+    // rather than "server explicitly chose Standard RDP Security". connect()
+    // uses this flag to decide whether attempting a TLS upgrade is safe.
+    private var negotiationPresent = false
+
     private fun readX224ConnectionConfirm(): Boolean {
+        // Reset per-attempt state so a retry via connectWithoutNla() never
+        // reuses results from the previous (failed) negotiation.
+        negotiatedNla = false
+        negotiatedHybridEx = false
+        serverSelectedProtocol = 0
+        negotiationPresent = false
+
         val header = ByteArray(4)
         inputStream?.readFully(header) ?: return false
         if (header[0] != TPKT_VERSION.toByte()) return false
 
         val length = ((header[2].toInt() and 0xFF) shl 8) or (header[3].toInt() and 0xFF)
+        if (length < 4) return false
         val data = ByteArray(length - 4)
         inputStream?.readFully(data) ?: return false
 
@@ -247,6 +367,7 @@ class RdpClient(
             val negType = data[6].toInt() and 0xFF
             when (negType) {
                 0x02 -> { // RDP_NEG_RSP
+                    negotiationPresent = true
                     val selected = ((data.getOrElse(11) { 0 }.toInt() and 0xFF) shl 24) or
                             ((data.getOrElse(10) { 0 }.toInt() and 0xFF) shl 16) or
                             ((data.getOrElse(9) { 0 }.toInt() and 0xFF) shl 8) or
@@ -257,12 +378,39 @@ class RdpClient(
                     Log.d(TAG, "Server selected: 0x${selected.toString(16)} (NLA=$negotiatedNla, HybridEX=$negotiatedHybridEx)")
                 }
                 0x03 -> { // RDP_NEG_FAILURE
+                    negotiationPresent = true
                     val failureCode = data.getOrElse(8) { 0 }.toInt() and 0xFF
-                    throw RdpException("Server rejected connection (code $failureCode). Try toggling 'Use NLA Authentication'.")
+                    throw RdpException(describeNegFailure(failureCode))
+                }
+                else -> {
+                    // Unrecognized negotiation type byte but still inside an
+                    // 8+ byte CC - treat as "no usable negotiation" rather
+                    // than silently trusting serverSelectedProtocol=0.
+                    Log.w(TAG, "Unrecognized X.224 negotiation type: 0x${negType.toString(16)}")
                 }
             }
         }
+        // data.size < 8: server replied with a bare X.224 CC and no
+        // RDP_NEG_RSP/FAILURE at all (negotiationPresent stays false). This
+        // is normal for pre-RDP-5.2 servers that don't understand
+        // RDP_NEG_REQ; connect() treats this the same as "Standard RDP
+        // Security" and skips the TLS upgrade.
         return true
+    }
+
+    /**
+     * Translates an RDP_NEG_FAILURE failureCode (MS-RDPBCGR 2.2.1.2.2) into
+     * an actionable message instead of a bare numeric code that means
+     * nothing to the user.
+     */
+    private fun describeNegFailure(code: Int): String = when (code) {
+        1 -> "SSL_REQUIRED_BY_SERVER - server requires TLS; enable NLA/TLS for this profile"
+        2 -> "SSL_NOT_ALLOWED_BY_SERVER - server forbids TLS; disable 'Use NLA Authentication' for this profile"
+        3 -> "SSL_CERT_NOT_ON_SERVER - server has no certificate configured for TLS"
+        4 -> "INCONSISTENT_FLAGS - conflicting protocol flags were requested"
+        5 -> "HYBRID_REQUIRED_BY_SERVER - server requires NLA (CredSSP); enable 'Use NLA Authentication' for this profile"
+        6 -> "SSL_WITH_USER_AUTH_REQUIRED_BY_SERVER - server requires TLS with NLA"
+        else -> "Server rejected the connection (RDP_NEG_FAILURE code $code, see MS-RDPBCGR 2.2.1.2.2)"
     }
 
     /**
@@ -321,16 +469,48 @@ class RdpClient(
     }
 
     /**
-     * WINDOWS 8/8.1 SUPPORT: Updated Client Core Data with RDP 8.0/8.1 features
-     * 
-     * RDP 8.0 (Windows 8) introduces:
-     * - UDP transport support
-     * - Dynamic virtual channels
-     * - Improved compression
-     * 
-     * RDP 8.1 (Windows 8.1) introduces:
-     * - Multi-touch support
-     * - Improved WAN performance
+     * FIX: This function previously built TS_UD_CS_CORE with fields in the
+     * WRONG ORDER and WRONG SIZES relative to MS-RDPBCGR 2.2.1.3.2. The
+     * correct field layout (all little-endian) is:
+     *
+     *   header.type        (2) = 0xC001 (CS_CORE)
+     *   header.length       (2) = 216
+     *   version             (4)
+     *   desktopWidth        (2)
+     *   desktopHeight       (2)
+     *   colorDepth          (2) = RNS_UD_COLOR_8BPP (legacy, ignored once highColorDepth present)
+     *   SASSequence         (2) = RNS_UD_SAS_DEL (0xAA03)
+     *   keyboardLayout      (4)
+     *   clientBuild         (4)
+     *   clientName          (32) - 16 UTF-16 code units INCLUDING null terminator
+     *   keyboardType        (4)
+     *   keyboardSubType     (4)
+     *   keyboardFunctionKey (4)
+     *   imeFileName         (64)
+     *   postBeta2ColorDepth (2)
+     *   clientProductId     (2)
+     *   serialNumber        (4)
+     *   highColorDepth      (2)
+     *   supportedColorDepths(2)
+     *   earlyCapabilityFlags(2)
+     *   clientDigProductId  (64)
+     *   connectionType      (1)
+     *   pad1octet           (1)
+     *   serverSelectedProtocol (4) - MUST echo exactly what the server chose
+     *
+     * Total = 2+2+4+2+2+2+2+4+4+32+4+4+4+64+2+2+4+2+2+2+64+1+1+4 = 216 bytes.
+     *
+     * The previous implementation packed clientName as only 15 chars
+     * (30 bytes) + a trailing short (2 bytes) = 32 bytes by coincidence, but
+     * then wrote keyboardType/keyboardSubType/keyboardFunctionKey, an
+     * imeFileName of only 32 zero bytes (32 instead of 64), a SECOND bogus
+     * "color depth" field, and other fields in an order that does not match
+     * any RDP version — meaning serverSelectedProtocol (which servers
+     * cross-check against the RDP_NEG_RSP they just sent) ended up at the
+     * wrong byte offset entirely. Any server that validates this structure
+     * strictly (Windows Server 2016+ commonly does) rejects the MCS Connect
+     * Initial outright, which is exactly the "connects via TCP/TLS/NLA but
+     * then fails" pattern this client exhibited.
      */
     private fun buildClientCoreData(): ByteArray {
         val buf = ByteBuffer.allocate(216).order(ByteOrder.LITTLE_ENDIAN)
@@ -341,33 +521,43 @@ class RdpClient(
             else -> RDP_VERSION_8_0
         }
 
-        buf.putShort(0xC001.toShort())
-        buf.putShort(216)
-        buf.putInt(rdpVersion)  // RDP version 8.0 or 8.1
-        buf.putShort(displayWidth.toShort())
-        buf.putShort(displayHeight.toShort())
-        buf.putShort(0xCA01.toShort())
-        buf.putShort(0xAA03.toShort())
-        buf.putInt(0x409)  // English US
-        buf.putInt(2600)   // Client build
-        val name = "HEXRDP".padEnd(15, '\u0000')
-        name.forEach { buf.putShort(it.code.toShort()) }
-        buf.putShort(0)
-        buf.putInt(0x04)
-        buf.putInt(0x00)
-        buf.putInt(0x0C)
-        repeat(32) { buf.put(0) }
-        buf.putShort(0xCA01.toShort())
-        buf.putShort(1)
-        buf.putInt(0)
-        buf.putShort(32)
-        buf.putShort(0x0007)
-        buf.putShort(0x0001)
-        repeat(64) { buf.put(0) }
-        buf.put(0)
-        buf.put(0)
-        // CRITICAL: serverSelectedProtocol must match what server selected
+        buf.putShort(0xC001.toShort())       // header.type = CS_CORE
+        buf.putShort(216)                    // header.length
+        buf.putInt(rdpVersion)                // version
+        buf.putShort(displayWidth.toShort())  // desktopWidth
+        buf.putShort(displayHeight.toShort()) // desktopHeight
+        buf.putShort(0xCA01.toShort())        // colorDepth = RNS_UD_COLOR_8BPP (legacy; highColorDepth below is authoritative)
+        buf.putShort(0xAA03.toShort())        // SASSequence = RNS_UD_SAS_DEL
+        buf.putInt(0x00000409)                // keyboardLayout = English (US)
+        buf.putInt(2600)                      // clientBuild
+
+        // clientName: exactly 32 bytes = 16 UTF-16LE code units, including
+        // the null terminator, padded with NULs. "HEXRDP" is 6 chars, so we
+        // need 6 + 10 NUL code units = 16 total.
+        val clientName = "HEXRDP".padEnd(16, '\u0000')
+        clientName.forEach { buf.putShort(it.code.toShort()) }
+
+        buf.putInt(4)                         // keyboardType = 4 (IBM enhanced 101/102-key)
+        buf.putInt(0)                         // keyboardSubType
+        buf.putInt(12)                        // keyboardFunctionKey = 12 function keys
+        repeat(64) { buf.put(0) }              // imeFileName (64 bytes, unused)
+
+        buf.putShort(0xCA01.toShort())        // postBeta2ColorDepth (ignored; highColorDepth wins)
+        buf.putShort(1)                        // clientProductId
+        buf.putInt(0)                          // serialNumber
+        buf.putShort(0x0018.toShort())         // highColorDepth = 24 bpp (safe, widely-supported default)
+        buf.putShort(0x000F.toShort())         // supportedColorDepths = 24|16|15|32 bpp (RNS_UD_24/16/15/32BPP_SUPPORT)
+        buf.putShort(0x0001.toShort())         // earlyCapabilityFlags = RNS_UD_CS_SUPPORT_ERRINFO_PDU
+        repeat(64) { buf.put(0) }              // clientDigProductId (64 bytes, unused)
+        buf.put(0)                             // connectionType (only meaningful if 0x20 set in earlyCapabilityFlags)
+        buf.put(0)                             // pad1octet
+
+        // CRITICAL: serverSelectedProtocol must exactly echo what the server
+        // chose in its RDP_NEG_RSP — this is the field the original code got
+        // right in isolation, but it landed at the wrong offset because
+        // everything before it was misaligned.
         buf.putInt(serverSelectedProtocol)
+
         return buf.array().copyOf(buf.position())
     }
 
@@ -552,7 +742,18 @@ class RdpClient(
         sendRaw(CredSspHelper.buildNegotiateTsRequest(negotiateMsg))
         Log.d(TAG, "NLA Step 1: NEGOTIATE sent")
 
-        val challengeRequest = readRaw() ?: throw RdpAuthException("No CredSSP CHALLENGE response")
+        val challengeRequest = readRaw() ?: throw RdpAuthException("No CredSSP CHALLENGE response (server closed the connection)")
+
+        // FIX: A server that rejects the request at this stage (e.g. NLA
+        // disabled by policy, account restrictions evaluated early) may
+        // reply with a TSRequest carrying an errorCode field instead of a
+        // negoToken. The original code went straight to extractNegoToken()
+        // and threw a generic "Missing NTLM CHALLENGE token" in that case,
+        // hiding the real, more useful NTSTATUS reason from the user.
+        CredSspHelper.extractErrorCode(challengeRequest)?.let { code ->
+            throw RdpAuthException("Server rejected NLA negotiation: ${CredSspHelper.describeErrorCode(code)}")
+        }
+
         val challengeMsg = CredSspHelper.extractNegoToken(challengeRequest)
             ?: throw RdpAuthException("Missing NTLM CHALLENGE token")
         val challenge = NtlmHelper.parseChallengeMessage(challengeMsg)
@@ -587,9 +788,25 @@ class RdpClient(
         sendRaw(CredSspHelper.buildAuthenticateTsRequest(authResult.message, pubKeyAuthToken))
         Log.d(TAG, "NLA Step 3: AUTHENTICATE + pubKeyAuth sent")
 
-        val pubKeyResponse = readRaw() ?: throw RdpAuthException("No pubKeyAuth response - server rejected credentials")
+        val pubKeyResponse = readRaw() ?: throw RdpAuthException(
+            "No pubKeyAuth response - server closed the connection after credentials were sent " +
+            "(commonly: wrong username/password, or NLA not actually enabled on the server)"
+        )
+
+        // FIX: This is the most common place a real authentication failure
+        // (bad password, locked/disabled account, expired password, the
+        // "Encryption Oracle Remediation" policy mismatch, ...) is reported
+        // by the server. The original code unconditionally tried
+        // extractPubKeyAuth() first and threw a generic, unhelpful
+        // "Missing pubKeyAuth confirmation" — the actual NTSTATUS reason in
+        // the errorCode field was parsed (extractErrorCode existed) but
+        // never read from this call site at all.
+        CredSspHelper.extractErrorCode(pubKeyResponse)?.let { code ->
+            throw RdpAuthException(CredSspHelper.describeErrorCode(code))
+        }
+
         val encryptedServerConfirm = CredSspHelper.extractPubKeyAuth(pubKeyResponse)
-            ?: throw RdpAuthException("Missing pubKeyAuth confirmation")
+            ?: throw RdpAuthException("Missing pubKeyAuth confirmation (server did not return errorCode either - likely an incompatible CredSSP version)")
         Log.d(TAG, "NLA Step 4: Server pubKeyAuth received")
 
         // Verify using version-aware method
