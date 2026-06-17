@@ -12,9 +12,12 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -217,13 +220,19 @@ class RdpSessionViewModel @Inject constructor(
             )
             rdpClient = client
 
-            var lastError: String? = null
+            // FIX: previously `client.error` and `client.sessionState` were
+            // collected in two independent `launch {}` coroutines. Both can
+            // be scheduled in either order, so the ERROR/AUTH_FAILED branch
+            // below could run before the matching error string had been
+            // written to `lastError`, silently falling back to a useless
+            // generic message ("Connection error"). combine() guarantees we
+            // always see the latest error value paired with the state that
+            // triggered it, since both flows are read from a single
+            // downstream collector instead of two racing ones.
             launch {
-                client.error.collect { msg -> lastError = msg }
-            }
-
-            launch {
-                client.sessionState.collect { rdpState ->
+                kotlinx.coroutines.flow.combine(client.sessionState, client.error.onStart { emit("") }) { rdpState, msg ->
+                    rdpState to msg.ifBlank { null }
+                }.collect { (rdpState, lastError) ->
                     when (rdpState) {
                         RdpSessionState.CONNECTED    -> _state.emit(SessionUiState.Connected(profile))
                         RdpSessionState.AUTH_FAILED  -> _state.emit(SessionUiState.Error(lastError ?: "Authentication failed. Check credentials."))
@@ -235,6 +244,10 @@ class RdpSessionViewModel @Inject constructor(
                         saveLastFrameThumbnail()
                     }
                 }
+            }
+            var lastError: String? = null
+            launch {
+                client.error.collect { msg -> lastError = msg }
             }
 
             // Periodically persist a thumbnail of the current screen (issue #11
@@ -825,11 +838,20 @@ fun ConnectingOverlay(name: String) {
 
 @Composable
 fun ErrorOverlay(message: String, onClose: () -> Unit) {
+    // TEMPORARY diagnostic UI: lets the full connection trace (the same
+    // text now bundled into `message`, see RdpClient.connect()) be copied
+    // out of the device without adb/logcat. Remove once the underlying
+    // connection issue is confirmed fixed.
+    val context = androidx.compose.ui.platform.LocalContext.current
+    var copied by remember { mutableStateOf(false) }
+
     Box(Modifier.fillMaxSize().background(DeepSpace), Alignment.Center) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(16.dp),
-            modifier = Modifier.padding(32.dp)
+            modifier = Modifier
+                .padding(32.dp)
+                .fillMaxWidth()
         ) {
             Icon(Icons.Outlined.ErrorOutline, null, tint = NovaPink, modifier = Modifier.size(64.dp))
             Text(
@@ -838,8 +860,39 @@ fun ErrorOverlay(message: String, onClose: () -> Unit) {
                 color      = StarDust,
                 fontWeight = FontWeight.Bold
             )
-            Text(message, style = MaterialTheme.typography.bodyMedium, color = CometTail)
-            SpaceButton("Close", onClose, Modifier.width(160.dp), variant = ButtonVariant.GHOST)
+
+            // Scrollable box so a long trace doesn't push the buttons off-screen.
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 280.dp)
+                    .background(DeepSpace.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                    .border(BorderStroke(1.dp, CometTail.copy(alpha = 0.3f)), RoundedCornerShape(8.dp))
+                    .padding(12.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = CometTail,
+                    fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                SpaceButton(
+                    if (copied) "Copied ✓" else "Copy log",
+                    onClick = {
+                        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("RDP connection log", message))
+                        copied = true
+                    },
+                    modifier = Modifier.width(150.dp),
+                    variant = ButtonVariant.PRIMARY
+                )
+                SpaceButton("Close", onClose, Modifier.width(150.dp), variant = ButtonVariant.GHOST)
+            }
         }
     }
 }
