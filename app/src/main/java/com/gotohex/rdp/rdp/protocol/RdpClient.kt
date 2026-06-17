@@ -368,7 +368,21 @@ class RdpClient(
         val cookieBytes = cookie.toByteArray()
 
         val requestedProtocols = when {
-            forceStandardRdpSecurity -> PROTOCOL_SSL
+            // Standard RDP Security means NO TLS and NO NLA — this must be
+            // PROTOCOL_RDP (0x0), not PROTOCOL_SSL. Requesting PROTOCOL_SSL
+            // here was the bug: when the server had just rejected TLS/NLA
+            // with SSL_NOT_ALLOWED_BY_SERVER, the "fallback" reconnect was
+            // asking for the exact same PROTOCOL_SSL again and predictably
+            // got rejected a second time, making the fallback a no-op.
+            //
+            // Same fix applies to the manual case: useNla=false ("disable
+            // 'Use NLA Authentication' in the profile", exactly what the
+            // error message tells the user to do) must also request
+            // PROTOCOL_RDP — previously it fell into the `else` branch
+            // below and still requested PROTOCOL_SSL, so toggling the
+            // setting in the UI silently did nothing for servers that
+            // reject TLS entirely.
+            forceStandardRdpSecurity || !credentials.useNla -> PROTOCOL_RDP
             credentials.useNla -> PROTOCOL_SSL or PROTOCOL_HYBRID or PROTOCOL_HYBRID_EX
             else -> PROTOCOL_SSL
         }
