@@ -17,6 +17,34 @@ import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 import java.security.cert.X509Certificate
 
+// SUPPORTING TYPES
+enum class RdpSessionState { DISCONNECTED, CONNECTING, CONNECTED, RECONNECTING, AUTH_FAILED, ERROR }
+enum class MouseButton { LEFT, RIGHT, MIDDLE }
+
+data class RdpFrameUpdate(
+    val x: Int, val y: Int, val width: Int, val height: Int,
+    val pixels: IntArray, val fullScreen: Boolean = false
+)
+
+class RdpException(message: String) : Exception(message)
+class RdpAuthException(message: String) : Exception(message)
+class RdpNegotiationFailure(val code: Int, message: String) : Exception(message)
+
+class BandwidthDetector {
+    private var lastBytes = 0L
+    private var lastTime = System.currentTimeMillis()
+    fun recordBytes(bytes: Int) { lastBytes += bytes }
+    fun getCurrentKbps(): Int {
+        val now = System.currentTimeMillis()
+        val elapsed = now - lastTime
+        if (elapsed < 100) return 0
+        val kbps = (lastBytes * 8 / elapsed).toInt()
+        lastBytes = 0; lastTime = now
+        return kbps
+    }
+}
+
+
 /**
  * Pure Kotlin RDP Protocol Client v5.2
  * Maximum compatibility: Windows XP/7/8/8.1/10/11, Server 2008-2022, xrdp/Linux
@@ -1059,7 +1087,7 @@ class RdpClient(
                     _error.emit("Connection lost: ${e.message}")
                     break
                 }
-                delay(100L * consecutiveErrors)
+                delay(100 * consecutiveErrors)
             }
         }
         cleanup()
@@ -1290,29 +1318,3 @@ class RdpClient(
     }
 }
 
-// SUPPORTING TYPES
-enum class RdpSessionState { DISCONNECTED, CONNECTING, CONNECTED, RECONNECTING, AUTH_FAILED, ERROR }
-enum class MouseButton { LEFT, RIGHT, MIDDLE }
-
-data class RdpFrameUpdate(
-    val x: Int, val y: Int, val width: Int, val height: Int,
-    val pixels: IntArray, val fullScreen: Boolean = false
-)
-
-class RdpExcegption(message: String) : Exception(message)
-class RdpAuthException(message: String) : Exception(message)
-class RdpNegotiationFailure(val code: Int, message: String) : Exception(message)
-
-class BandwidthDetector {
-    private var lastBytes = 0L
-    private var lastTime = System.currentTimeMillis()
-    fun recordBytes(bytes: Int) { lastBytes += bytes }
-    fun getCurrentKbps(): Int {
-        val now = System.currentTimeMillis()
-        val elapsed = now - lastTime
-        if (elapsed < 100) return 0
-        val kbps = (lastBytes * 8 / elapsed).toInt()
-        lastBytes = 0; lastTime = now
-        return kbps
-    }
-}
