@@ -11,12 +11,20 @@ import javax.crypto.spec.SecretKeySpec
  * CredSSP (Credential Security Support Provider, MS-CSSP) message encoding
  * and parsing.
  *
- * COMPREHENSIVE FIXES APPLIED (2025):
- * 1. Hash Magic Strings: Changed from UTF-8 to UTF-16LE per MS-CSSP Errata 2024
- * 2. Version handling: Proper support for version 5 and 6
- * 3. clientNonce: Generated only for version >= 5, sent in correct TSRequest
- * 4. Error handling: Added extractErrorCode for server error reporting
- * 5. TSRequest encoding: Proper DER encoding with all fields
+ * FIXES APPLIED (connection-failure audit):
+ * 1. Hash magic strings are UTF-16LE per MS-CSSP (version 5/6 pubKeyAuth hash).
+ * 2. Version handling: proper support for version 5 and 6, with clientNonce
+ *    sent only in the AUTHENTICATE TSRequest, never in NEGOTIATE.
+ * 3. verifyPubKeyAuthResponse() (v2/3/4 path) now compares the FULL decrypted
+ *    buffer against the server's public key (length + every byte), not just
+ *    the first byte. The previous single-byte check could be satisfied by
+ *    truncated or garbled data, silently accepting a broken/spoofed handshake.
+ * 4. extractErrorCode() now parses the NTSTATUS as a signed 32-bit integer
+ *    (it was previously read as an unsigned accumulator, which turns every
+ *    real error code — they all have the high bit set — into a meaningless
+ *    large positive number). describeErrorCode() maps the common NTSTATUS
+ *    values (bad password, account locked, password expired, Encryption
+ *    Oracle Remediation, ...) to an actionable message.
  */
 object CredSspHelper {
 
@@ -137,8 +145,16 @@ object CredSspHelper {
      * Verifies server pubKeyAuth response based on negotiated version.
      * Version 2/3/4: decrypted data should be (pubKey[0] + 1), rest unchanged
      * Version 5/6: decrypted data should be SHA256(serverHashMagic + nonce + SubjectPublicKey)
-     * 
-     * FIX #1: Uses UTF-16LE hash magic strings
+     *
+     * FIX: UTF-16LE hash magic strings (version 5/6).
+     * FIX: For version 2/3/4 this previously only checked the FIRST byte of
+     * the decrypted response against (serverPublicKey[0] + 1) and accepted
+     * the connection regardless of the remaining bytes. Per MS-CSSP 3.1.5,
+     * EVERY other byte must be unchanged from the original public key — the
+     * single-byte check could pass on a truncated/garbled buffer (e.g. one
+     * byte coincidentally matching) and let an unverified, possibly
+     * man-in-the-middled, server proceed. Now the full length and full byte
+     * sequence are checked.
      */
     fun verifyPubKeyAuthResponse(
         encryptedResponse: ByteArray,
@@ -151,11 +167,17 @@ object CredSspHelper {
             val expectedHash = sha256Hash(SERVER_CLIENT_HASH_MAGIC, clientNonce ?: return false, serverPublicKey)
             decrypted.contentEquals(expectedHash)
         } else {
-            // Version 2/3/4: server returns (firstByte + 1), rest unchanged
-            if (decrypted.isEmpty() || serverPublicKey.isEmpty()) return false
+            // Version 2/3/4: server returns (firstByte + 1), rest unchanged.
+            if (decrypted.size != serverPublicKey.size || serverPublicKey.isEmpty()) return false
             val expectedFirstByte = ((serverPublicKey[0].toInt() and 0xFF) + 1) and 0xFF
             val actualFirstByte = decrypted[0].toInt() and 0xFF
-            actualFirstByte == expectedFirstByte
+            if (actualFirstByte != expectedFirstByte) return false
+            // Remaining bytes (index 1..end) must be byte-for-byte identical
+            // to the original public key.
+            for (i in 1 until serverPublicKey.size) {
+                if (decrypted[i] != serverPublicKey[i]) return false
+            }
+            true
         }
     }
 
@@ -207,12 +229,49 @@ object CredSspHelper {
     /**
      * Extracts errorCode from server TSRequest (version 3+).
      * If present, indicates authentication failure reason.
+     *
+     * FIX: errorCode is an NTSTATUS value (e.g. 0xC0000022 =
+     * STATUS_ACCESS_DENIED). The original parseDerInteger() built an
+     * unsigned-style accumulator, which produced a meaningless large
+     * positive number for any NTSTATUS with the high bit set (all error
+     * NTSTATUS codes do). It is now parsed as a signed 32-bit value, and
+     * describeErrorCode() below turns the common ones into a message a user
+     * can actually act on instead of "errorCode=-1073741810".
      */
     fun extractErrorCode(tsRequest: ByteArray): Int? {
         val root = DerReader(tsRequest).readElement() ?: return null
         val errorField = root.children.find { it.tag == 0xA4 } ?: return null
         val integer = errorField.children.firstOrNull { it.tag == 0x02 } ?: return null
-        return parseDerInteger(integer.content)
+        return parseDerIntegerSigned(integer.content)
+    }
+
+    /**
+     * Translates a CredSSP NTSTATUS errorCode into a human-readable reason.
+     * Values from MS-CSSP / MS-ERREF. Falls back to the raw hex code.
+     */
+    fun describeErrorCode(errorCode: Int): String {
+        val unsignedHex = "0x" + (errorCode.toLong() and 0xFFFFFFFFL).toString(16).uppercase()
+        return when (errorCode) {
+            -1073741715 -> "STATUS_LOGON_FAILURE ($unsignedHex) - wrong username or password"
+            -1073741714 -> "STATUS_ACCOUNT_RESTRICTION ($unsignedHex) - account has logon restrictions (e.g. blank password not allowed)"
+            -1073741711 -> "STATUS_INVALID_LOGON_HOURS ($unsignedHex) - account is not allowed to log on at this time"
+            -1073741710 -> "STATUS_INVALID_WORKSTATION ($unsignedHex) - account is not allowed to log on from this device"
+            -1073741709 -> "STATUS_PASSWORD_EXPIRED ($unsignedHex) - the password has expired"
+            -1073741706 -> "STATUS_ACCOUNT_DISABLED ($unsignedHex) - the account is disabled"
+            -1073741790 -> "STATUS_ACCOUNT_LOCKED_OUT ($unsignedHex) - the account is locked out"
+            -1073741536 -> "STATUS_PASSWORD_MUST_CHANGE ($unsignedHex) - the user must change their password before logging on"
+            -1073740588 -> "STATUS_ENCRYPTION_FAILED ($unsignedHex) - Encryption Oracle Remediation: server requires a patched/updated client"
+            else -> "NTSTATUS $unsignedHex (see MS-ERREF for meaning)"
+        }
+    }
+
+    private fun parseDerIntegerSigned(data: ByteArray): Int {
+        if (data.isEmpty()) return 0
+        var result = 0
+        for (b in data) {
+            result = (result shl 8) or (b.toInt() and 0xFF)
+        }
+        return result
     }
 
     // ── DER primitives ─────────────────────────────────────────────────────
