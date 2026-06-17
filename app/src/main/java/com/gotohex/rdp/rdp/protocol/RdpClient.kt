@@ -204,7 +204,35 @@ class RdpClient(
             sendX224ConnectionRequest()
             RdpLog.d("STEP 2: X.224 CR sent")
 
-            if (!readX224ConnectionConfirm()) throw RdpException("X.224 connection rejected")
+            try {
+                if (!readX224ConnectionConfirm()) throw RdpException("X.224 connection rejected")
+            } catch (e: RdpNegotiationFailure) {
+                // SSL_NOT_ALLOWED_BY_SERVER (code 2): the server refuses TLS/NLA
+                // entirely and only supports legacy "Standard RDP Security".
+                // This used to be a hard failure even with allowFallback=true,
+                // because it's thrown by readX224ConnectionConfirm() itself —
+                // before negotiatedNla/negotiatedHybridEx are even known, so
+                // the NLA-failure fallback further down never got a chance to
+                // run. Reconnect from scratch over Standard RDP Security here,
+                // the same way the NLA-failure path below does.
+                if (e.code == 2 && allowFallback) {
+                    RdpLog.w("Server rejected TLS/NLA (SSL_NOT_ALLOWED_BY_SERVER) — retrying with Standard RDP Security", e)
+                    cleanup()
+                    val fellBack = connectWithoutNla()
+                    if (fellBack) {
+                        connected = true
+                        RdpLog.d("STEP 10b: Connected via Standard RDP Security fallback (server rejected TLS/NLA)")
+                        _sessionState.emit(RdpSessionState.CONNECTED)
+                        clientScope.launch { receiveLoop() }
+                        return@withContext true
+                    }
+                    val fallbackMsg = "Server only supports legacy Standard RDP Security, and the fallback " +
+                        "connection attempt also failed. Try disabling 'Use NLA Authentication' in the profile manually."
+                    RdpLog.e(fallbackMsg)
+                    throw RdpException(fallbackMsg)
+                }
+                throw e
+            }
             RdpLog.d("STEP 3: X.224 CC (selected=0x${serverSelectedProtocol.toString(16)}, NLA=$negotiatedNla, HybridEX=$negotiatedHybridEx)")
 
             if (negotiationPresent && serverSelectedProtocol != PROTOCOL_RDP) {
@@ -406,7 +434,7 @@ class RdpClient(
                 0x03 -> {
                     negotiationPresent = true
                     val failureCode = data.getOrElse(11) { 0 }.toInt() and 0xFF
-                    throw RdpException(describeNegFailure(failureCode))
+                    throw RdpNegotiationFailure(failureCode, describeNegFailure(failureCode))
                 }
                 else -> RdpLog.w("Unrecognized X.224 negotiation type: 0x${negType.toString(16)}")
             }
@@ -1503,6 +1531,16 @@ data class RdpFrameUpdate(
 
 class RdpException(message: String) : Exception(message)
 class RdpAuthException(message: String) : Exception(message)
+
+/**
+ * Thrown when the server's X.224 Connection Confirm carries an
+ * RDP_NEG_FAILURE PDU (MS-RDPBCGR §2.2.1.2.2) — i.e. the server rejected
+ * the client's proposed security protocols outright, before any TLS/NLA
+ * negotiation could even start. [code] is the raw failureCode byte so
+ * callers can react to specific cases (e.g. SSL_NOT_ALLOWED_BY_SERVER = 2)
+ * without parsing the human-readable message.
+ */
+class RdpNegotiationFailure(val code: Int, message: String) : Exception(message)
 
 class BandwidthDetector {
     private var lastBytes = 0L
