@@ -16,11 +16,25 @@ import java.nio.ByteOrder
  * - JPEG bitmap - for slow connections
  * - RemoteFX (simplified) - for modern servers
  *
- * Performance strategy:
- * - LOW_BANDWIDTH: 8bpp, heavy JPEG compression
- * - MEDIUM: 16bpp, RLE compression
- * - WIFI: 24bpp, RLE compression
- * - LAN: 32bpp, raw or light compression
+ * FIXES APPLIED (v4.2):
+ * FIX-G  decodeRleBitmap(): The previous implementation had three bugs
+ *         that made it produce a blank (all-zero) pixel array:
+ *         (a) Regular run (0x00): column index was computed as `i % width`
+ *             but `i` was the run-index, not the absolute pixel column, so
+ *             consecutive runs never advanced past column 0. Now uses a
+ *             flat pixel-index cursor that advances correctly across rows.
+ *         (b) Literal run (0x40): bytes were read from the stream but pixels
+ *             were never written to the output array. Now converts each read
+ *             literal pixel with pixelToArgb() and stores it.
+ *         (c) End-of-scanline (0xF0): row counter decremented even when the
+ *             cursor had not reached the end of the row, leaving partial rows.
+ *             Now the cursor is snapped to the row boundary on EOL.
+ *
+ * FIX-H  decodeRawBitmap(): 8 bpp (256-colour palette) mode was
+ *         unhandled and fell through to `return null`. Servers that
+ *         negotiate LOW_BANDWIDTH or older XP/2003 targets can send 8 bpp
+ *         frames. Added a greyscale fallback so the frame is at least
+ *         displayed; a proper palette would need the Palette Update PDU.
  */
 class RdpBitmapDecoder {
 
@@ -28,16 +42,16 @@ class RdpBitmapDecoder {
         private const val TAG = "BitmapDecoder"
 
         // Bitmap compression types
-        const val BITMAP_COMPRESSION_NONE = 0x00
-        const val BITMAP_COMPRESSION_RLE = 0x01
-        const val BITMAP_COMPRESSION_JPEG = 0x04
+        const val BITMAP_COMPRESSION_NONE    = 0x00
+        const val BITMAP_COMPRESSION_RLE     = 0x01
+        const val BITMAP_COMPRESSION_JPEG    = 0x04
         const val BITMAP_COMPRESSION_REMOTEFX = 0x08
 
         // Update types
-        const val UPDATE_TYPE_ORDERS = 0x0000
-        const val UPDATE_TYPE_BITMAP = 0x0001
-        const val UPDATE_TYPE_PALETTE = 0x0002
-        const val UPDATE_TYPE_SYNCHRONIZE = 0x0003
+        const val UPDATE_TYPE_ORDERS       = 0x0000
+        const val UPDATE_TYPE_BITMAP       = 0x0001
+        const val UPDATE_TYPE_PALETTE      = 0x0002
+        const val UPDATE_TYPE_SYNCHRONIZE  = 0x0003
     }
 
     /**
@@ -52,8 +66,8 @@ class RdpBitmapDecoder {
             val updateType = buf.short.toInt() and 0xFFFF
 
             when (updateType) {
-                UPDATE_TYPE_BITMAP -> decodeBitmapUpdate(buf, frames, performance)
-                UPDATE_TYPE_ORDERS -> decodeOrdersUpdate(buf, frames, screenWidth, screenHeight)
+                UPDATE_TYPE_BITMAP    -> decodeBitmapUpdate(buf, frames, performance)
+                UPDATE_TYPE_ORDERS    -> decodeOrdersUpdate(buf, frames, screenWidth, screenHeight)
                 UPDATE_TYPE_SYNCHRONIZE -> { /* no-op */ }
                 else -> Log.v(TAG, "Unknown update type: 0x${updateType.toString(16)}")
             }
@@ -71,42 +85,33 @@ class RdpBitmapDecoder {
         repeat(numRectangles) {
             if (buf.remaining() < 18) return@repeat
             try {
-                val destLeft = buf.short.toInt() and 0xFFFF
-                val destTop = buf.short.toInt() and 0xFFFF
-                val destRight = buf.short.toInt() and 0xFFFF
+                val destLeft   = buf.short.toInt() and 0xFFFF
+                val destTop    = buf.short.toInt() and 0xFFFF
+                val destRight  = buf.short.toInt() and 0xFFFF
                 val destBottom = buf.short.toInt() and 0xFFFF
-                val width = buf.short.toInt() and 0xFFFF
-                val height = buf.short.toInt() and 0xFFFF
-                val bitsPerPixel = buf.short.toInt() and 0xFFFF
-                val flags = buf.short.toInt() and 0xFFFF
-                val bitmapLength = buf.short.toInt() and 0xFFFF
+                val width         = buf.short.toInt() and 0xFFFF
+                val height        = buf.short.toInt() and 0xFFFF
+                val bitsPerPixel  = buf.short.toInt() and 0xFFFF
+                val flags         = buf.short.toInt() and 0xFFFF
+                val bitmapLength  = buf.short.toInt() and 0xFFFF
 
                 if (bitmapLength <= 0 || buf.remaining() < bitmapLength) return@repeat
                 val bitmapData = ByteArray(bitmapLength)
                 buf.get(bitmapData)
 
                 val isCompressed = (flags and 0x0001) != 0
-                val isJpeg = (flags and 0x0008) != 0
+                val isJpeg       = (flags and 0x0008) != 0
 
                 val pixels = when {
-                    isJpeg -> decodeJpegBitmap(bitmapData, width, height)
+                    isJpeg       -> decodeJpegBitmap(bitmapData, width, height)
                     isCompressed -> decodeRleBitmap(bitmapData, width, height, bitsPerPixel)
-                    else -> decodeRawBitmap(bitmapData, width, height, bitsPerPixel)
+                    else         -> decodeRawBitmap(bitmapData, width, height, bitsPerPixel)
                 }
 
                 if (pixels != null) {
-                    // CRITICAL FIX: the destination rectangle (destLeft/Top/Right/Bottom)
-                    // can have different dimensions than the bitmap data itself
-                    // (width/height read just above). Previously the frame's
-                    // width/height were taken from the *destination rectangle*
-                    // while `pixels` was sized from the *decoded bitmap* — when
-                    // these differ (which real servers do regularly), every
-                    // downstream consumer (Bitmap.createBitmap / setPixels) reads
-                    // past the end of `pixels`, throwing an
-                    // ArrayIndexOutOfBoundsException on the UI/collector thread
-                    // with no handler, which kills the whole app the moment a
-                    // frame update arrives — i.e. immediately after "Connected".
-                    // Always report the *actual* decoded bitmap size.
+                    // Always report the *actual* decoded bitmap dimensions, not the
+                    // destination rectangle, to avoid ArrayIndexOutOfBoundsException
+                    // in Bitmap.setPixels() when dest and bitmap sizes differ.
                     frames.add(
                         RdpFrameUpdate(
                             x = destLeft,
@@ -129,16 +134,17 @@ class RdpBitmapDecoder {
         screenWidth: Int,
         screenHeight: Int
     ) {
-        // Simplified order processing - ScrBlt, MemBlt, PatBlt
         if (buf.remaining() < 4) return
         buf.short // pad2octets
-        val numberOrders = buf.short.toInt() and 0xFFFF
-        // Order processing is complex; we request full screen refresh instead
-        // via suppress output / refresh rect PDU
+        buf.short // numberOrders — we do not process drawing orders yet
+        // A refresh rect / suppress output PDU would be sent from the session
+        // activity to request a full-screen repaint when orders are unsupported.
     }
 
     /**
-     * Decode raw (uncompressed) bitmap
+     * Decode raw (uncompressed) bitmap.
+     * FIX-H: Added 8 bpp greyscale fallback (was returning null, causing blank frames
+     * on XP/2003 targets and LOW_BANDWIDTH mode).
      */
     private fun decodeRawBitmap(data: ByteArray, width: Int, height: Int, bpp: Int): IntArray? {
         if (width <= 0 || height <= 0) return null
@@ -147,7 +153,6 @@ class RdpBitmapDecoder {
         when (bpp) {
             32 -> {
                 val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
-                // RDP bitmaps are bottom-up
                 for (row in height - 1 downTo 0) {
                     for (col in 0 until width) {
                         if (buf.remaining() < 4) break
@@ -169,9 +174,9 @@ class RdpBitmapDecoder {
                         val r = buf.get().toInt() and 0xFF
                         pixels[row * width + col] = 0xFF000000.toInt() or (r shl 16) or (g shl 8) or b
                     }
-                    // Align to 4 bytes
-                    val padding = (3 * width) % 4
-                    if (padding != 0) repeat(4 - padding) { if (buf.remaining() > 0) buf.get() }
+                    val rowBytes = 3 * width
+                    val padding = if (rowBytes % 4 == 0) 0 else 4 - (rowBytes % 4)
+                    repeat(padding) { if (buf.remaining() > 0) buf.get() }
                 }
             }
             16 -> {
@@ -181,9 +186,22 @@ class RdpBitmapDecoder {
                         if (buf.remaining() < 2) break
                         val pixel16 = buf.short.toInt() and 0xFFFF
                         val r = ((pixel16 shr 11) and 0x1F) * 255 / 31
-                        val g = ((pixel16 shr 5) and 0x3F) * 255 / 63
-                        val b = (pixel16 and 0x1F) * 255 / 31
+                        val g = ((pixel16 shr 5)  and 0x3F) * 255 / 63
+                        val b = ( pixel16          and 0x1F) * 255 / 31
                         pixels[row * width + col] = 0xFF000000.toInt() or (r shl 16) or (g shl 8) or b
+                    }
+                }
+            }
+            8 -> {
+                // FIX-H: 8 bpp palette mode — palette is carried in a separate
+                // Palette Update PDU which we don't yet track; render as greyscale
+                // so the frame is visible rather than discarded.
+                val buf = ByteBuffer.wrap(data)
+                for (row in height - 1 downTo 0) {
+                    for (col in 0 until width) {
+                        if (!buf.hasRemaining()) break
+                        val v = buf.get().toInt() and 0xFF
+                        pixels[row * width + col] = 0xFF000000.toInt() or (v shl 16) or (v shl 8) or v
                     }
                 }
             }
@@ -194,50 +212,72 @@ class RdpBitmapDecoder {
     }
 
     /**
-     * Decode RLE compressed bitmap (Interleaved RLE)
+     * Decode RLE compressed bitmap (MS-RDPBCGR Interleaved RLE).
+     *
+     * FIX-G: Rewrote cursor management. Previous bugs:
+     * (a) Regular run: col = i % width — wrong; must be absolute pixel position.
+     * (b) Literal run: bytes read but pixels never stored.
+     * (c) EOL (0xF0): row decremented without flushing partial row cursor.
      */
     private fun decodeRleBitmap(data: ByteArray, width: Int, height: Int, bpp: Int): IntArray? {
         if (width <= 0 || height <= 0) return null
         val pixels = IntArray(width * height)
+        val bytesPerPixel = maxOf(bpp / 8, 1)
 
         try {
-            val bytesPerPixel = bpp / 8
             val src = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
-            val rowData = ByteArray(width * bytesPerPixel)
-            var dstRow = height - 1
+            // RDP bitmaps are bottom-up: start writing from the last row.
+            var row = height - 1
+            var col = 0
 
-            while (src.hasRemaining() && dstRow >= 0) {
+            fun writePixel(pixelBytes: ByteArray) {
+                if (row < 0) return
+                pixels[row * width + col] = pixelToArgb(pixelBytes, bpp)
+                col++
+                if (col >= width) { col = 0; row-- }
+            }
+
+            while (src.hasRemaining() && row >= 0) {
                 val code = src.get().toInt() and 0xFF
                 val orderType = code and 0xF0
-                val runLength = when {
-                    (code and 0x0F) != 0 -> code and 0x0F
+                val nibble    = code and 0x0F
+
+                // Run length: if low nibble is non-zero → length = nibble
+                // else next byte gives (length - 16) → length = nextByte + 16
+                val runLength: Int = when {
+                    nibble != 0       -> nibble
                     src.hasRemaining() -> (src.get().toInt() and 0xFF) + 16
-                    else -> break
+                    else               -> break
                 }
 
                 when (orderType) {
-                    0x00 -> { // Regular run
+                    0x00 -> {
+                        // Regular run: one pixel value repeated runLength times
                         if (src.remaining() < bytesPerPixel) break
-                        val pixel = ByteArray(bytesPerPixel)
-                        src.get(pixel)
-                        repeat(runLength) { i ->
-                            val col = (i) % width // simplified
-                            if (col < width && dstRow >= 0) {
-                                val argb = pixelToArgb(pixel, bpp)
-                                pixels[dstRow * width + col] = argb
-                            }
+                        val pixelBytes = ByteArray(bytesPerPixel)
+                        src.get(pixelBytes)
+                        repeat(runLength) { writePixel(pixelBytes) }
+                    }
+                    0x40 -> {
+                        // Literal run: runLength distinct pixels
+                        repeat(runLength) {
+                            if (src.remaining() < bytesPerPixel) return@repeat
+                            val pixelBytes = ByteArray(bytesPerPixel)
+                            src.get(pixelBytes)
+                            writePixel(pixelBytes)   // FIX-G(b): was missing this call
                         }
                     }
-                    0x40 -> { // Non-run (literal)
-                        val bytesNeeded = runLength * bytesPerPixel
-                        if (src.remaining() < bytesNeeded) break
-                        for (i in 0 until runLength) {
-                            val pixel = ByteArray(bytesPerPixel)
-                            src.get(pixel)
-                        }
+                    0xF0 -> {
+                        // End of scanline — snap to next row boundary
+                        col = 0
+                        row--
                     }
-                    0xF0 -> { // End of scanline
-                        dstRow--
+                    else -> {
+                        // Unknown order — skip to avoid desync
+                        Log.v(TAG, "RLE unknown order 0x${orderType.toString(16)}, skipping $runLength pixels")
+                        val skipBytes = runLength * bytesPerPixel
+                        if (src.remaining() >= skipBytes) src.position(src.position() + skipBytes)
+                        else break
                     }
                 }
             }
@@ -276,24 +316,23 @@ class RdpBitmapDecoder {
 
     private fun pixelToArgb(pixel: ByteArray, bpp: Int): Int {
         return when (bpp) {
-            32 -> {
-                val b = pixel[0].toInt() and 0xFF
-                val g = pixel[1].toInt() and 0xFF
-                val r = pixel[2].toInt() and 0xFF
-                0xFF000000.toInt() or (r shl 16) or (g shl 8) or b
-            }
-            24 -> {
-                val b = pixel[0].toInt() and 0xFF
-                val g = pixel[1].toInt() and 0xFF
-                val r = pixel[2].toInt() and 0xFF
+            32, 24 -> {
+                val b = pixel.getOrElse(0) { 0 }.toInt() and 0xFF
+                val g = pixel.getOrElse(1) { 0 }.toInt() and 0xFF
+                val r = pixel.getOrElse(2) { 0 }.toInt() and 0xFF
                 0xFF000000.toInt() or (r shl 16) or (g shl 8) or b
             }
             16 -> {
-                val p = ((pixel[1].toInt() and 0xFF) shl 8) or (pixel[0].toInt() and 0xFF)
+                val p = ((pixel.getOrElse(1) { 0 }.toInt() and 0xFF) shl 8) or
+                         (pixel.getOrElse(0) { 0 }.toInt() and 0xFF)
                 val r = ((p shr 11) and 0x1F) * 255 / 31
-                val g = ((p shr 5) and 0x3F) * 255 / 63
-                val b = (p and 0x1F) * 255 / 31
+                val g = ((p shr 5)  and 0x3F) * 255 / 63
+                val b = ( p         and 0x1F) * 255 / 31
                 0xFF000000.toInt() or (r shl 16) or (g shl 8) or b
+            }
+            8 -> {
+                val v = pixel.getOrElse(0) { 0 }.toInt() and 0xFF
+                0xFF000000.toInt() or (v shl 16) or (v shl 8) or v
             }
             else -> 0xFF000000.toInt()
         }
