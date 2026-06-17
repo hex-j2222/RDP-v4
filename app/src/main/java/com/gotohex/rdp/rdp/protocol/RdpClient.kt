@@ -332,7 +332,7 @@ class RdpClient(
         negReq.putInt(requestedProtocols)
         val negReqBytes = negReq.array()
 
-        val x224Length = 1 + 1 + 2 + cookieBytes.size + negReqBytes.size + 2
+        val x224Length = 7 + cookieBytes.size + negReqBytes.size
         val tpktLength = 4 + x224Length
 
         val buf = ByteBuffer.allocate(tpktLength)
@@ -370,14 +370,14 @@ class RdpClient(
         if (data.isEmpty() || (data[1].toInt() and 0xFF) != 0xD0) return false
 
         if (data.size >= 8) {
-            val negType = data[6].toInt() and 0xFF
+            val negType = data[7].toInt() and 0xFF
             when (negType) {
                 0x02 -> {
                     negotiationPresent = true
-                    val selected = ((data.getOrElse(11) { 0 }.toInt() and 0xFF) shl 24) or
-                            ((data.getOrElse(10) { 0 }.toInt() and 0xFF) shl 16) or
-                            ((data.getOrElse(9)  { 0 }.toInt() and 0xFF) shl 8)  or
-                            (data.getOrElse(8)   { 0 }.toInt() and 0xFF)
+                    val selected = ((data.getOrElse(14) { 0 }.toInt() and 0xFF) shl 24) or
+                            ((data.getOrElse(13) { 0 }.toInt() and 0xFF) shl 16) or
+                            ((data.getOrElse(12) { 0 }.toInt() and 0xFF) shl 8)  or
+                            (data.getOrElse(11)  { 0 }.toInt() and 0xFF)
                     serverSelectedProtocol = selected
                     negotiatedNla      = (selected and PROTOCOL_HYBRID) != 0
                     negotiatedHybridEx = (selected and PROTOCOL_HYBRID_EX) != 0
@@ -385,7 +385,7 @@ class RdpClient(
                 }
                 0x03 -> {
                     negotiationPresent = true
-                    val failureCode = data.getOrElse(8) { 0 }.toInt() and 0xFF
+                    val failureCode = data.getOrElse(11) { 0 }.toInt() and 0xFF
                     throw RdpException(describeNegFailure(failureCode))
                 }
                 else -> Log.w(TAG, "Unrecognized X.224 negotiation type: 0x${negType.toString(16)}")
@@ -524,16 +524,30 @@ class RdpClient(
         Log.d(TAG, "NLA Step 5: Encrypted credentials sent – CredSSP complete")
     }
 
+    /**
+     * BUG-8 FIX: Early User Authorization Result (MS-RDPBCGR 2.2.1.2.3) is a
+     * raw 4-byte little-endian DWORD, NOT an ASN.1 structure.
+     * Previous code used readRaw() which expects a 0x30 ASN.1 tag — the server
+     * sends 0x00 (first byte of ACCESS_PERMITTED=0), causing readRaw() to
+     * return null → handleEarlyUserAuthResult() returned false → connection
+     * immediately threw RdpAuthException even with correct credentials.
+     *   0x00000000 = ACCESS_PERMITTED
+     *   0x00000002 = ACCESS_DENIED
+     *   0x00000006 = ACCESS_DENIED_FIPS
+     */
     private fun handleEarlyUserAuthResult(): Boolean {
         return try {
-            val result = readRaw() ?: return false
-            if (result.size < 2) return false
-            val authResult = (result[0].toInt() and 0xFF) or ((result[1].toInt() and 0xFF) shl 8)
-            Log.d(TAG, "Early User Authorization Result: 0x${authResult.toString(16)}")
-            authResult != 0x0001
+            val buf = ByteArray(4)
+            inputStream?.readFully(buf) ?: return true  // unreadable = assume permitted
+            val result = ((buf[3].toInt() and 0xFF) shl 24) or
+                         ((buf[2].toInt() and 0xFF) shl 16) or
+                         ((buf[1].toInt() and 0xFF) shl 8)  or
+                          (buf[0].toInt() and 0xFF)
+            Log.d(TAG, "Early User Authorization Result: 0x${result.toString(16).padStart(8, '0')}")
+            result == 0x00000000  // only ACCESS_PERMITTED is success
         } catch (e: Exception) {
             Log.w(TAG, "Early User Auth Result handling failed: ${e.message}")
-            true
+            true  // if we can't read it, assume permitted and continue
         }
     }
 
@@ -606,40 +620,99 @@ class RdpClient(
         return buf.array()
     }
 
+    /**
+     * BUG-7 FIX: Complete rewrite of MCS Connect Initial + GCC wrapping.
+     *
+     * Previous code had THREE fatal bugs:
+     *   7a) MCS Connect Initial tag was 0x65 alone — MUST be 0x7F 0x65
+     *       (T.125 BER Application class, constructed, tag 101).
+     *   7b) Each DomainParameters SEQUENCE was 0x30 0x00 (empty).
+     *       Must be 0x30 0x1E + 30 bytes of BER INTEGERs per T.125 §11.1.
+     *   7c) The inner "GCC" dos was actually building a second MCS wrapper
+     *       with the wrong tag, resulting in double-wrapped garbage.
+     *       The correct GCC Conference Create Request payload is:
+     *         T.124 key (7 bytes) + PER-encoded ConferenceCreateRequest header
+     *         + H221 "Duca" NonStandard key + userData.
+     *
+     * Correct structure (per MS-RDPBCGR 2.2.1.3, T.124, T.125, FreeRDP gcc.c):
+     *
+     *   0x7F 0x65 <BER-length>          ← MCS Connect Initial
+     *     04 01 01                       ← callingDomainSelector
+     *     04 01 01                       ← calledDomainSelector
+     *     01 01 FF                       ← upwardFlag = TRUE
+     *     [targetParameters  – 32 bytes] ← SEQUENCE of 8 BER INTEGERs
+     *     [minimumParameters – 32 bytes]
+     *     [maximumParameters – 32 bytes]
+     *     04 <BER-length>                ← userData OCTET STRING
+     *       00 05 00 14 7C 00 01         ← T.124 ConnectData key (PER OID)
+     *       00 08 <len-2B-BE>            ← conferenceCreateRequest CHOICE + PER length
+     *       00 01 C0 00                  ← fixed ConferenceCreateRequest PER fields
+     *       44 75 63 61                  ← H221 NonStandard key "Duca"
+     *       <userDataLen-2B-LE>          ← CS_* blocks length (little-endian)
+     *       [userData]                   ← CS_CORE + CS_SECURITY + CS_NET + CS_CLUSTER
+     */
     private fun wrapInGccConferenceCreateRequest(userData: ByteArray): ByteArray {
-        val output = ByteArrayOutputStream()
-        val dos = DataOutputStream(output)
-        dos.write(byteArrayOf(0x7F.toByte(), 0x65))
-        writeBerLength(dos, userData.size + 14)
-        dos.write(byteArrayOf(0x04, 0x01, 0x01, 0x04, 0x01, 0x01))
-        dos.write(byteArrayOf(0x01, 0x01, 0xFF.toByte()))
-        dos.write(byteArrayOf(0x30, 0x1A, 0x02, 0x01, 0x22))
-        dos.write(byteArrayOf(0x04, 0x09, 0x00, 0x05))
-        dos.write("Duca".toByteArray())
-        dos.write(byteArrayOf(0x04.toByte()))
-        writeBerLength(dos, userData.size)
-        dos.write(userData)
-        val gccPayload = output.toByteArray()
+        // === GCC Conference Create Request payload (T.124 PER) ===
+        // Bytes after T.124 key: CHOICE(0) + ConferenceCreateRequest in PER
+        // remaining = bytes after the 2-byte PER length field to end
+        val remaining = 4 + 4 + 2 + userData.size  // 00 01 C0 00 + "Duca" + len(2) + userData
+        val gccConferenceHeader = byteArrayOf(
+            0x00, 0x08,                                         // conferenceCreateRequest CHOICE
+            (remaining ushr 8).toByte(), (remaining and 0xFF).toByte(), // PER length (big-endian)
+            0x00, 0x01, 0xC0.toByte(), 0x00,                   // ConferenceCreateRequest fixed fields
+            0x44, 0x75, 0x63, 0x61,                            // H221 NonStandard key = "Duca"
+            (userData.size and 0xFF).toByte(), (userData.size ushr 8).toByte() // userData length (little-endian)
+        )
+        val t124Key = byteArrayOf(0x00, 0x05, 0x00, 0x14, 0x7C, 0x00, 0x01)
+        val gccPayload = t124Key + gccConferenceHeader + userData
 
-        val mcsOut = ByteArrayOutputStream()
-        val mcsDos = DataOutputStream(mcsOut)
-        mcsDos.write(byteArrayOf(0x65.toByte()))
-        writeBerLength(mcsDos, gccPayload.size + 10)
-        mcsDos.write(byteArrayOf(0x04, 0x01, 0x01, 0x04, 0x01, 0x01))
-        mcsDos.write(byteArrayOf(0x01, 0x01, 0xFF.toByte()))
-        mcsDos.write(byteArrayOf(0x30, 0x00, 0x30, 0x00, 0x30, 0x00))
-        mcsDos.write(byteArrayOf(0x04.toByte()))
-        writeBerLength(mcsDos, gccPayload.size)
-        mcsDos.write(gccPayload)
-        return mcsOut.toByteArray()
+        // === DomainParameters (T.125 BER SEQUENCE of 8 INTEGERs) ===
+        val targetParams  = buildDomainParameters(34,    2,     0,     1, 0, 1, 65535, 2)
+        val minimumParams = buildDomainParameters(1,     1,     1,     1, 0, 1, 512,   2)
+        val maximumParams = buildDomainParameters(65535, 64535, 65535, 1, 0, 1, 65535, 2)
+
+        // === MCS Connect Initial body ===
+        val mcsBody = byteArrayOf(
+            0x04, 0x01, 0x01,        // callingDomainSelector: OCTET STRING length=1, value=1
+            0x04, 0x01, 0x01,        // calledDomainSelector:  OCTET STRING length=1, value=1
+            0x01, 0x01, 0xFF.toByte()  // upwardFlag: BOOLEAN = TRUE
+        ) + targetParams + minimumParams + maximumParams +
+            byteArrayOf(0x04) + berLengthBytes(gccPayload.size) + gccPayload
+
+        // === MCS Connect Initial outer wrapper ===
+        val out = ByteArrayOutputStream()
+        out.write(0x7F); out.write(0x65)                       // APPLICATION 101, constructed
+        out.write(berLengthBytes(mcsBody.size))
+        out.write(mcsBody)
+        return out.toByteArray()
     }
 
-    private fun writeBerLength(dos: DataOutputStream, length: Int) {
-        when {
-            length < 0x80  -> dos.write(length)
-            length < 0x100 -> { dos.write(0x81); dos.write(length) }
-            else           -> { dos.write(0x82); dos.write((length shr 8) and 0xFF); dos.write(length and 0xFF) }
-        }
+    /**
+     * Build a T.125 DomainParameters SEQUENCE (BER).
+     * Per T.125 §11.1 / MS-RDPBCGR 2.2.1.3.1 DomainParameters:
+     *   maxChannelIds(2) maxUserIds(2) maxTokenIds(2) numPriorities(1)
+     *   minThroughput(1) maxHeight(1) maxMCSPDUsize(4) protocolVersion(1)
+     */
+    private fun buildDomainParameters(
+        maxCh: Int, maxUs: Int, maxTok: Int, numPri: Int,
+        minThr: Int, maxH: Int, maxPDU: Int, proto: Int
+    ): ByteArray {
+        val body = berInteger(maxCh, 2) + berInteger(maxUs, 2) + berInteger(maxTok, 2) +
+                   berInteger(numPri, 1) + berInteger(minThr, 1) + berInteger(maxH, 1) +
+                   berInteger(maxPDU, 4) + berInteger(proto, 1)
+        return byteArrayOf(0x30, body.size.toByte()) + body
+    }
+
+    private fun berInteger(value: Int, byteLen: Int): ByteArray {
+        val data = ByteArray(byteLen)
+        for (i in byteLen - 1 downTo 0) data[i] = (value ushr ((byteLen - 1 - i) * 8)).toByte()
+        return byteArrayOf(0x02, byteLen.toByte()) + data
+    }
+
+    private fun berLengthBytes(length: Int): ByteArray = when {
+        length < 0x80  -> byteArrayOf(length.toByte())
+        length < 0x100 -> byteArrayOf(0x81.toByte(), length.toByte())
+        else           -> byteArrayOf(0x82.toByte(), (length ushr 8).toByte(), (length and 0xFF).toByte())
     }
 
     private fun readMcsConnectResponse(): Boolean {
@@ -1217,46 +1290,55 @@ class RdpClient(
 
     fun sendMouseMove(x: Int, y: Int) {
         if (!connected) return
-        val buf = ByteBuffer.allocate(14).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putShort(0x0001); buf.putShort(0x0800)
-        buf.putShort(x.toShort()); buf.putShort(y.toShort())
+        val buf = ByteBuffer.allocate(7).order(ByteOrder.LITTLE_ENDIAN)
+        buf.put(0x10.toByte())           // eventHeader: eventCode=MOUSE (0x01 << 4)
+        buf.putShort(0x0800.toShort())   // PTRFLAGS_MOVE
+        buf.putShort(x.toShort())
+        buf.putShort(y.toShort())
         sendFastPathInput(buf.array().copyOf(buf.position()))
     }
 
     fun sendMouseClick(x: Int, y: Int, button: MouseButton, down: Boolean) {
         if (!connected) return
         val flags: Short = when (button) {
-            MouseButton.LEFT   -> if (down) 0x1000 else 0x0000
-            MouseButton.RIGHT  -> if (down) 0x2000 else 0x0000
-            MouseButton.MIDDLE -> if (down) 0x4000 else 0x0000
+            MouseButton.LEFT   -> if (down) (0x1000 or 0x8000) else 0x1000
+            MouseButton.RIGHT  -> if (down) (0x2000 or 0x8000) else 0x2000
+            MouseButton.MIDDLE -> if (down) (0x4000 or 0x8000) else 0x4000
         }.toShort()
-        val buf = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putShort(0x0001); buf.putShort(flags)
-        buf.putShort(x.toShort()); buf.putShort(y.toShort())
+        val buf = ByteBuffer.allocate(7).order(ByteOrder.LITTLE_ENDIAN)
+        buf.put(0x10.toByte())           // eventHeader: eventCode=MOUSE
+        buf.putShort(flags)
+        buf.putShort(x.toShort())
+        buf.putShort(y.toShort())
         sendFastPathInput(buf.array().copyOf(buf.position()))
     }
 
     fun sendMouseScroll(x: Int, y: Int, delta: Int) {
         if (!connected) return
-        val buf = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putShort(0x0001)
+        val buf = ByteBuffer.allocate(7).order(ByteOrder.LITTLE_ENDIAN)
+        buf.put(0x10.toByte())           // eventHeader: eventCode=MOUSE
         buf.putShort((0x0200 or if (delta > 0) 0x0100 else 0x0000).toShort())
-        buf.putShort(x.toShort()); buf.putShort(y.toShort())
+        buf.putShort(x.toShort())
+        buf.putShort(y.toShort())
         sendFastPathInput(buf.array().copyOf(buf.position()))
     }
 
     fun sendKeyEvent(scanCode: Int, down: Boolean, extended: Boolean = false) {
         if (!connected) return
-        val flags = (if (down) 0 else 0x8000) or (if (extended) 0x0100 else 0)
-        val buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putShort(flags.toShort()); buf.putShort(scanCode.toShort())
+        val eventFlags = (if (!down) 0x01 else 0x00) or (if (extended) 0x02 else 0x00)
+        val eventHeader = ((0x01 shl 4) or eventFlags).toByte()  // eventCode=KEYBOARD (0x01)
+        val buf = ByteBuffer.allocate(2)
+        buf.put(eventHeader)
+        buf.put((scanCode and 0xFF).toByte())
         sendFastPathInput(buf.array().copyOf(buf.position()))
     }
 
     fun sendUnicodeKeyEvent(char: Char, down: Boolean) {
         if (!connected) return
-        val buf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putShort(if (down) 0 else 0x8000.toShort())
+        val eventFlags = if (!down) 0x01 else 0x00
+        val eventHeader = ((0x04 shl 4) or eventFlags).toByte()  // eventCode=UNICODE_KEYBOARD (0x04)
+        val buf = ByteBuffer.allocate(3).order(ByteOrder.LITTLE_ENDIAN)
+        buf.put(eventHeader)
         buf.putShort(char.code.toShort())
         sendFastPathInput(buf.array().copyOf(buf.position()))
     }
@@ -1276,7 +1358,7 @@ class RdpClient(
         try {
             val header = ByteBuffer.allocate(4)
             header.put(0x10)
-            writeFastPathLength(header, data.size + 1)
+            writeFastPathLength(header, data.size + 2)
             val packet = header.array().copyOf(header.position()) + data
             synchronized(outputStream!!) { outputStream?.write(packet); outputStream?.flush() }
         } catch (e: Exception) { Log.w(TAG, "Failed to send input: ${e.message}") }
