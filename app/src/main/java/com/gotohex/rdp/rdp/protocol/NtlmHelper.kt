@@ -151,7 +151,8 @@ object NtlmHelper {
         domain: String,
         challenge: NtlmChallenge,
         negotiateMessage: ByteArray,
-        challengeMessage: ByteArray
+        challengeMessage: ByteArray,
+        serverSpn: String = ""
     ): AuthenticateResult {
         val clientChallenge = generateClientChallenge()
         val ntHash = ntHash(password)
@@ -161,7 +162,7 @@ object NtlmHelper {
         // Check if MIC is required (MsvAvFlags bit 0x2)
         val micRequired = isMicRequired(challenge.targetInfo)
 
-        val blob = buildNtlmV2Blob(clientChallenge, timestamp, challenge.targetInfo)
+        val blob = buildNtlmV2Blob(clientChallenge, timestamp, challenge.targetInfo, serverSpn)
         val ntProofStr = computeNtProofStr(ntlmV2Hash, challenge.serverChallenge, blob)
         val ntResponse = ntProofStr + blob
 
@@ -410,24 +411,116 @@ object NtlmHelper {
         return mac.doFinal(blob)
     }
 
-    private fun buildNtlmV2Blob(clientChallenge: ByteArray, timestamp: Long, targetInfo: ByteArray): ByteArray {
-        val terminatedTargetInfo = if (targetInfo.size >= 4 &&
-            (targetInfo[targetInfo.size - 4].toInt() and 0xFF) == 0x00 &&
-            (targetInfo[targetInfo.size - 3].toInt() and 0xFF) == 0x00 &&
-            (targetInfo[targetInfo.size - 2].toInt() and 0xFF) == 0x00 &&
-            (targetInfo[targetInfo.size - 1].toInt() and 0xFF) == 0x00) {
-            targetInfo
-        } else {
-            targetInfo + byteArrayOf(0x00, 0x00, 0x00, 0x00)
+    /**
+     * Builds the NTLMv2 blob (TargetInfoFields) per MS-NLMP 3.3.2.
+     *
+     * FIX-M (v4.2): Windows Server 2012+ and all 2025/2026 servers require the
+     * client to AUGMENT the server's targetInfo before embedding it in the blob:
+     *
+     * 1. If MsvAvTimestamp (AvId=0x0007) is present in the server's targetInfo,
+     *    the client MUST use that timestamp (not generate its own) and MUST add
+     *    MsvAvFlags (AvId=0x0006) with bit 0x00000002 set (indicating MIC).
+     *    Failing to do so causes Windows 2012/2016/2019/2022/2025 to reject the
+     *    AUTHENTICATE_MESSAGE with STATUS_LOGON_FAILURE, even with correct creds.
+     *
+     * 2. MsvAvChannelBindings (AvId=0x000A) must be added as 16 zero bytes
+     *    (indicates no channel binding) when not already present.
+     *
+     * 3. MsvAvTargetName (AvId=0x0009) with the server's SPN ("TERMSRV/<host>")
+     *    should be added for servers that enforce it (Server 2019+).
+     *
+     * 4. The EOL terminator check was wrong: it checked the last 4 bytes for
+     *    zeros, but MsvAvEOL is avId(0x0000) + avLen(0x0000) = 4 zero bytes —
+     *    the check was accidentally correct in structure but missed cases where
+     *    the last actual AV pair had trailing zeros in its value. Replaced with
+     *    a proper AV_PAIR walker that checks if EOL is already the last entry.
+     */
+    private fun buildNtlmV2Blob(
+        clientChallenge: ByteArray,
+        timestamp: Long,
+        targetInfo: ByteArray,
+        serverSpn: String = ""
+    ): ByteArray {
+        // Walk the server's targetInfo and extract/modify fields
+        var effectiveTimestamp = timestamp
+        var hasMsvAvFlags = false
+        var hasChannelBindings = false
+        var hasTargetName = false
+        var hasMsvAvTimestamp = false
+
+        val avPairs = mutableListOf<Pair<Int, ByteArray>>()
+        var offset = 0
+        while (offset + 4 <= targetInfo.size) {
+            val avId = (targetInfo[offset].toInt() and 0xFF) or
+                    ((targetInfo[offset + 1].toInt() and 0xFF) shl 8)
+            val avLen = (targetInfo[offset + 2].toInt() and 0xFF) or
+                    ((targetInfo[offset + 3].toInt() and 0xFF) shl 8)
+            if (avId == 0x0000) break  // MsvAvEOL
+            val avVal = targetInfo.copyOfRange(
+                (offset + 4).coerceAtMost(targetInfo.size),
+                (offset + 4 + avLen).coerceAtMost(targetInfo.size)
+            )
+            when (avId) {
+                0x0006 -> { hasMsvAvFlags = true }   // MsvAvFlags
+                0x0007 -> {                           // MsvAvTimestamp
+                    hasMsvAvTimestamp = true
+                    if (avLen == 8) {
+                        // Use server-provided timestamp per MS-NLMP §3.1.5.1.2
+                        effectiveTimestamp = ByteBuffer.wrap(avVal).order(ByteOrder.LITTLE_ENDIAN).long
+                    }
+                }
+                0x000A -> { hasChannelBindings = true } // MsvAvChannelBindings
+                0x0009 -> { hasTargetName = true }      // MsvAvTargetName
+            }
+            avPairs.add(Pair(avId, avVal))
+            offset += 4 + avLen
         }
 
-        val buf = ByteBuffer.allocate(28 + terminatedTargetInfo.size).order(ByteOrder.LITTLE_ENDIAN)
-        buf.put(byteArrayOf(0x01, 0x01, 0x00, 0x00))
-        buf.putInt(0)
-        buf.putLong(timestamp)
-        buf.put(clientChallenge)
-        buf.putInt(0)
-        buf.put(terminatedTargetInfo)
+        // Build augmented targetInfo
+        val augmented = ByteArrayOutputStream()
+        for ((avId, avVal) in avPairs) {
+            augmented.write(avId and 0xFF); augmented.write((avId shr 8) and 0xFF)
+            augmented.write(avVal.size and 0xFF); augmented.write((avVal.size shr 8) and 0xFF)
+            augmented.write(avVal)
+        }
+
+        // FIX-M(1): Add MsvAvFlags with MIC bit (0x00000002) when server sent MsvAvTimestamp
+        // This signals to the server that our AUTHENTICATE message contains a valid MIC
+        if (hasMsvAvTimestamp && !hasMsvAvFlags) {
+            val flagsVal = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(0x00000002).array()
+            augmented.write(0x06); augmented.write(0x00)  // MsvAvFlags
+            augmented.write(0x04); augmented.write(0x00)  // length = 4
+            augmented.write(flagsVal)
+        }
+
+        // FIX-M(2): Add MsvAvChannelBindings (16 zero bytes) if absent
+        if (!hasChannelBindings) {
+            augmented.write(0x0A); augmented.write(0x00)  // MsvAvChannelBindings
+            augmented.write(0x10); augmented.write(0x00)  // length = 16
+            augmented.write(ByteArray(16))
+        }
+
+        // FIX-M(3): Add MsvAvTargetName (SPN) if absent and SPN is known
+        if (!hasTargetName && serverSpn.isNotEmpty()) {
+            val spnBytes = serverSpn.toByteArray(Charsets.UTF_16LE)
+            augmented.write(0x09); augmented.write(0x00)  // MsvAvTargetName
+            augmented.write(spnBytes.size and 0xFF); augmented.write((spnBytes.size shr 8) and 0xFF)
+            augmented.write(spnBytes)
+        }
+
+        // MsvAvEOL terminator
+        augmented.write(0x00); augmented.write(0x00)
+        augmented.write(0x00); augmented.write(0x00)
+
+        val augmentedTargetInfo = augmented.toByteArray()
+
+        val buf = ByteBuffer.allocate(28 + augmentedTargetInfo.size).order(ByteOrder.LITTLE_ENDIAN)
+        buf.put(byteArrayOf(0x01, 0x01, 0x00, 0x00))   // RespType + HiRespType + reserved
+        buf.putInt(0)                                    // Reserved2
+        buf.putLong(effectiveTimestamp)                  // Timestamp (server's or our own)
+        buf.put(clientChallenge)                         // ClientChallenge[8]
+        buf.putInt(0)                                    // Reserved3
+        buf.put(augmentedTargetInfo)
         return buf.array().copyOf(buf.position())
     }
 
@@ -443,10 +536,48 @@ object NtlmHelper {
     }
 
     private fun rc4(key: ByteArray, data: ByteArray): ByteArray {
-        ensureBouncyCastleRegistered()
-        val cipher = Cipher.getInstance("ARC4", "BC")
-        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "ARC4"))
-        return cipher.doFinal(data)
+        // Try BouncyCastle first (fastest, supports all Android versions)
+        try {
+            ensureBouncyCastleRegistered()
+            val cipher = Cipher.getInstance("ARC4", "BC")
+            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "ARC4"))
+            return cipher.doFinal(data)
+        } catch (_: Exception) {}
+
+        // Fallback 1: platform RC4 (available on Android < 10 without BC)
+        try {
+            val cipher = Cipher.getInstance("RC4")
+            cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "RC4"))
+            return cipher.doFinal(data)
+        } catch (_: Exception) {}
+
+        // Fallback 2: pure-Kotlin RC4 — always works, no JCE dependency.
+        // FIX-L: Devices without BouncyCastle installed and Android 10+
+        // (which removed RC4 from the default JCE provider) would throw here,
+        // making NLA authentication always fail with a cryptic JCE exception.
+        return rc4Pure(key, data)
+    }
+
+    /**
+     * Pure-Kotlin RC4 (ARCFOUR) stream cipher.
+     * Identical to RFC 4345 / the RC4 algorithm used by MS-NLMP.
+     */
+    private fun rc4Pure(key: ByteArray, data: ByteArray): ByteArray {
+        val s = IntArray(256) { it }
+        var j = 0
+        for (i in 0..255) {
+            j = (j + s[i] + (key[i % key.size].toInt() and 0xFF)) and 0xFF
+            val tmp = s[i]; s[i] = s[j]; s[j] = tmp
+        }
+        val out = ByteArray(data.size)
+        var i = 0; j = 0
+        for (k in data.indices) {
+            i = (i + 1) and 0xFF
+            j = (j + s[i]) and 0xFF
+            val tmp = s[i]; s[i] = s[j]; s[j] = tmp
+            out[k] = (data[k].toInt() xor s[(s[i] + s[j]) and 0xFF]).toByte()
+        }
+        return out
     }
 
     @Volatile
