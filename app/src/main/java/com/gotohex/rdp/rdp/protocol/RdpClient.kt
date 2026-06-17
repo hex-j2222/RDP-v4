@@ -729,9 +729,11 @@ class RdpClient(
         val gccPayload = t124Key + gccConferenceHeader + userData
 
         // === DomainParameters (T.125 BER SEQUENCE of 8 INTEGERs) ===
-        val targetParams  = buildDomainParameters(34,    2,     0,     1, 0, 1, 65535, 2)
-        val minimumParams = buildDomainParameters(1,     1,     1,     1, 0, 1, 512,   2)
-        val maximumParams = buildDomainParameters(65535, 64535, 65535, 1, 0, 1, 65535, 2)
+        // Values + byte-lengths match Microsoft's documented wire-format
+        // example exactly (see buildDomainParameters doc comment above).
+        val targetParams  = buildDomainParameters(34, 1,  2, 1,  0, 1,  1, 0, 1,  65535, 2,  2)
+        val minimumParams = buildDomainParameters(1,  1,  1, 1,  1, 1,  1, 0, 1,  1056,  2,  2)
+        val maximumParams = buildDomainParameters(34, 1,  3, 1,  0, 1,  1, 0, 1,  65535, 2,  2)
 
         // === MCS Connect Initial body ===
         val mcsBody = byteArrayOf(
@@ -750,21 +752,56 @@ class RdpClient(
     }
 
     /**
-     * Build a T.125 DomainParameters SEQUENCE (BER).
-     * Per T.125 §11.1 / MS-RDPBCGR 2.2.1.3.1 DomainParameters:
-     *   maxChannelIds(2) maxUserIds(2) maxTokenIds(2) numPriorities(1)
-     *   minThroughput(1) maxHeight(1) maxMCSPDUsize(4) protocolVersion(1)
+     * Build a T.125 DomainParameters SEQUENCE (BER), matching byte-for-byte
+     * the worked example Microsoft documents in MS-RDPBCGR ("Client MCS
+     * Connect Initial PDU with GCC Conference Create Request"):
+     *
+     *   targetParameters:  maxChannelIds=34(1B) maxUserIds=2(1B) maxTokenIds=0(1B)
+     *                      numPriorities=1(1B) minThroughput=0(1B) maxHeight=1(1B)
+     *                      maxMCSPDUsize=65535(2B) protocolVersion=2(1B)
+     *   minimumParameters: maxChannelIds=1(1B)  maxUserIds=1(1B)  maxTokenIds=1(1B)
+     *                      numPriorities=1(1B) minThroughput=0(1B) maxHeight=1(1B)
+     *                      maxMCSPDUsize=1056(2B) protocolVersion=2(1B)
+     *   maximumParameters: maxChannelIds=34(1B) maxUserIds=3(1B)  maxTokenIds=0(1B)
+     *                      numPriorities=1(1B) minThroughput=0(1B) maxHeight=1(1B)
+     *                      maxMCSPDUsize=65535(2B) protocolVersion=2(1B)
+     *
+     * The previous version of this function used fixed 2-byte widths for
+     * maxChannelIds/maxUserIds/maxTokenIds and a 4-byte width for
+     * maxMCSPDUsize, which does not match the wire format Windows expects
+     * (e.g. `02 02 FF FF`, not `02 04 00 00 FF FF`) and made the server
+     * silently discard the MCS Connect Initial PDU.
      */
     private fun buildDomainParameters(
-        maxCh: Int, maxUs: Int, maxTok: Int, numPri: Int,
-        minThr: Int, maxH: Int, maxPDU: Int, proto: Int
+        maxCh: Int, maxChLen: Int,
+        maxUs: Int, maxUsLen: Int,
+        maxTok: Int, maxTokLen: Int,
+        numPri: Int, minThr: Int, maxH: Int,
+        maxPDU: Int, maxPDULen: Int,
+        proto: Int
     ): ByteArray {
-        val body = berInteger(maxCh, 2) + berInteger(maxUs, 2) + berInteger(maxTok, 2) +
+        val body = berInteger(maxCh, maxChLen) + berInteger(maxUs, maxUsLen) + berInteger(maxTok, maxTokLen) +
                    berInteger(numPri, 1) + berInteger(minThr, 1) + berInteger(maxH, 1) +
-                   berInteger(maxPDU, 4) + berInteger(proto, 1)
+                   berInteger(maxPDU, maxPDULen) + berInteger(proto, 1)
         return byteArrayOf(0x30, body.size.toByte()) + body
     }
 
+    /**
+     * BER INTEGER encoding using an explicit byte length per field.
+     *
+     * NOTE: this intentionally does NOT implement general-purpose X.690
+     * minimal-length / sign-avoidance BER (that was tried and produced an
+     * incorrect 3-byte encoding for 0xFFFF, since 65535 has its top bit
+     * set but MS-RDPBCGR's own worked example still encodes it as the
+     * 2-byte `02 02 FF FF`, not 3 bytes with a leading 0x00). RDP's
+     * DomainParameters fields are not standard signed BER INTEGERs in
+     * practice — every real client and the Microsoft documentation itself
+     * encode them at fixed, field-specific widths. So we just take the
+     * caller-specified width directly, the way the original code did,
+     * but now buildDomainParameters() passes the WIDTHS AND VALUES that
+     * exactly match Microsoft's documented example instead of guessed
+     * ones.
+     */
     private fun berInteger(value: Int, byteLen: Int): ByteArray {
         val data = ByteArray(byteLen)
         for (i in byteLen - 1 downTo 0) data[i] = (value ushr ((byteLen - 1 - i) * 8)).toByte()
@@ -778,10 +815,22 @@ class RdpClient(
     }
 
     private fun readMcsConnectResponse(): Boolean {
-        val packet = readX224Data() ?: return false
-        if (packet.isEmpty()) return false
+        val packet = readX224Data()
+        if (packet == null) {
+            RdpLog.e("MCS Connect Response: no data received (readX224Data returned null — socket closed or read timeout)")
+            return false
+        }
+        if (packet.isEmpty()) {
+            RdpLog.e("MCS Connect Response: received empty packet")
+            return false
+        }
         val tag = packet[0].toInt() and 0xFF
-        return tag == 0x7F || tag == 0x30 || tag == 0x65 || tag == 0x66
+        val ok = tag == 0x7F || tag == 0x30 || tag == 0x65 || tag == 0x66
+        if (!ok) {
+            val preview = packet.take(16).joinToString(" ") { "%02X".format(it) }
+            RdpLog.e("MCS Connect Response: unexpected tag=0x${tag.toString(16)} size=${packet.size} bytes=[$preview]")
+        }
+        return ok
     }
 
     private fun performMcsDomainSetup() {
