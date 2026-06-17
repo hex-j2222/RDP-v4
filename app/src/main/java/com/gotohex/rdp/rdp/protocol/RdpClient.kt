@@ -184,9 +184,10 @@ class RdpClient(
     // ── connect() ──────────────────────────────────────────────────────────
 
     suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
+        RdpLog.clear()
         try {
             _sessionState.emit(RdpSessionState.CONNECTING)
-            Log.d(TAG, "Connecting to ${credentials.host}:${credentials.port}")
+            RdpLog.d("Connecting to ${credentials.host}:${credentials.port}")
 
             val sock = Socket()
             sock.connect(InetSocketAddress(credentials.host, credentials.port), CONNECT_TIMEOUT_MS)
@@ -198,32 +199,32 @@ class RdpClient(
             inputStream = DataInputStream(BufferedInputStream(sock.getInputStream(), 65536))
             outputStream = DataOutputStream(BufferedOutputStream(sock.getOutputStream(), 65536))
 
-            Log.d(TAG, "STEP 1: TCP connected")
+            RdpLog.d("STEP 1: TCP connected")
 
             sendX224ConnectionRequest()
-            Log.d(TAG, "STEP 2: X.224 CR sent")
+            RdpLog.d("STEP 2: X.224 CR sent")
 
             if (!readX224ConnectionConfirm()) throw RdpException("X.224 connection rejected")
-            Log.d(TAG, "STEP 3: X.224 CC (selected=0x${serverSelectedProtocol.toString(16)}, NLA=$negotiatedNla, HybridEX=$negotiatedHybridEx)")
+            RdpLog.d("STEP 3: X.224 CC (selected=0x${serverSelectedProtocol.toString(16)}, NLA=$negotiatedNla, HybridEX=$negotiatedHybridEx)")
 
             if (negotiationPresent && serverSelectedProtocol != PROTOCOL_RDP) {
                 upgradeTls()
-                Log.d(TAG, "STEP 4: TLS upgraded")
+                RdpLog.d("STEP 4: TLS upgraded")
             } else {
-                Log.d(TAG, "STEP 4: Skipped TLS (Standard RDP Security or pre-negotiation server)")
+                RdpLog.d("STEP 4: Skipped TLS (Standard RDP Security or pre-negotiation server)")
             }
 
             if (negotiatedHybridEx) {
                 if (!handleEarlyUserAuthResult()) throw RdpAuthException("Early user authorization failed")
-                Log.d(TAG, "STEP 4a: Early User Auth Result handled")
+                RdpLog.d("STEP 4a: Early User Auth Result handled")
             }
 
             if (negotiatedNla || negotiatedHybridEx) {
                 try {
                     performNlaAuthentication()
-                    Log.d(TAG, "STEP 5: NLA complete")
+                    RdpLog.d("STEP 5: NLA complete")
                 } catch (e: Exception) {
-                    Log.w(TAG, "NLA failed: ${e.message}")
+                    RdpLog.w("NLA failed: ${e.message}", e)
                     val looksLikeBadCredentials = e is RdpAuthException &&
                         (e.message?.contains("LOGON_FAILURE") == true ||
                          e.message?.contains("ACCOUNT_DISABLED") == true ||
@@ -231,38 +232,41 @@ class RdpClient(
                          e.message?.contains("PASSWORD_EXPIRED") == true)
 
                     if (allowFallback && !looksLikeBadCredentials) {
-                        Log.w(TAG, "Attempting fallback to Standard RDP Security (NLA disabled)")
+                        RdpLog.w("Attempting fallback to Standard RDP Security (NLA disabled)")
                         cleanup()
                         val fellBack = connectWithoutNla()
                         if (fellBack) {
                             connected = true
+                            RdpLog.d("STEP 10b: Connected via Standard RDP Security fallback")
                             _sessionState.emit(RdpSessionState.CONNECTED)
                             clientScope.launch { receiveLoop() }
                             return@withContext true
                         }
-                        throw RdpAuthException(
-                            "NLA authentication failed (${e.message}), and fallback to Standard RDP " +
+                        val fallbackMsg = "NLA authentication failed (${e.message}), and fallback to Standard RDP " +
                             "Security also failed. Try disabling 'Use NLA Authentication' in the profile."
-                        )
+                        RdpLog.e(fallbackMsg)
+                        throw RdpAuthException(fallbackMsg)
                     }
-                    throw RdpAuthException("NLA authentication failed (${e.message}). Try disabling 'Use NLA Authentication'.")
+                    val msg = "NLA authentication failed (${e.message}). Try disabling 'Use NLA Authentication'."
+                    RdpLog.e(msg)
+                    throw RdpAuthException(msg)
                 }
             }
 
             sendMcsConnectInitial()
-            Log.d(TAG, "STEP 6: MCS Connect Initial sent")
+            RdpLog.d("STEP 6: MCS Connect Initial sent")
 
             if (!readMcsConnectResponse()) throw RdpException("MCS connection failed")
-            Log.d(TAG, "STEP 7: MCS Connect Response received")
+            RdpLog.d("STEP 7: MCS Connect Response received")
 
             performMcsDomainSetup()
-            Log.d(TAG, "STEP 8: MCS Domain Setup complete (userId=$mcsUserId)")
+            RdpLog.d("STEP 8: MCS Domain Setup complete (userId=$mcsUserId)")
 
             sendClientInfoPdu()
-            Log.d(TAG, "STEP 9: Client Info sent")
+            RdpLog.d("STEP 9: Client Info sent")
 
             handleDemandActivePdu()
-            Log.d(TAG, "STEP 10: Demand Active + post-connection sequence complete")
+            RdpLog.d("STEP 10: Demand Active + post-connection sequence complete")
 
             connected = true
             _sessionState.emit(RdpSessionState.CONNECTED)
@@ -270,15 +274,24 @@ class RdpClient(
             true
 
         } catch (e: RdpAuthException) {
-            Log.e(TAG, "Auth failed: ${e.message}")
+            // The error message is now emitted to `_error` and AWAITED
+            // before the state flow flips to AUTH_FAILED/ERROR. Previously
+            // these were observed by two independent, racing coroutines on
+            // the UI side, so the state change could be seen before the
+            // matching error string had arrived ("lastError" still null),
+            // and the UI fell back to a generic "Connection error" /
+            // "Authentication failed" message with no detail. Emitting in
+            // this fixed order from the single connect() coroutine removes
+            // that race entirely.
+            RdpLog.e("Auth failed: ${e.message}", e)
+            _error.emit("Authentication failed: ${e.message}\n\n--- Full trace ---\n${RdpLog.dump()}")
             _sessionState.emit(RdpSessionState.AUTH_FAILED)
-            _error.emit("Authentication failed: ${e.message}")
             cleanup()
             false
         } catch (e: Exception) {
-            Log.e(TAG, "Connection failed: ${e.message}", e)
+            RdpLog.e("Connection failed: ${e.message}", e)
+            _error.emit("Connection failed: ${e.message ?: "Unknown error"}\n\n--- Full trace ---\n${RdpLog.dump()}")
             _sessionState.emit(RdpSessionState.ERROR)
-            _error.emit("Connection failed: ${e.message ?: "Unknown error"}")
             cleanup()
             false
         }
@@ -297,18 +310,25 @@ class RdpClient(
 
             forceStandardRdpSecurity = true
             sendX224ConnectionRequest()
-            if (!readX224ConnectionConfirm()) return false
+            RdpLog.d("FALLBACK STEP 1: X.224 CR sent (Standard RDP Security)")
+            if (!readX224ConnectionConfirm()) { RdpLog.e("FALLBACK: X.224 connection rejected"); return false }
+            RdpLog.d("FALLBACK STEP 2: X.224 CC received")
 
             if (negotiationPresent && serverSelectedProtocol != PROTOCOL_RDP) upgradeTls()
+            RdpLog.d("FALLBACK STEP 3: TLS step done (or skipped)")
 
             sendMcsConnectInitial()
-            if (!readMcsConnectResponse()) return false
+            if (!readMcsConnectResponse()) { RdpLog.e("FALLBACK: MCS connection failed"); return false }
+            RdpLog.d("FALLBACK STEP 4: MCS connect response received")
             performMcsDomainSetup()
+            RdpLog.d("FALLBACK STEP 5: MCS domain setup complete (userId=$mcsUserId)")
             sendClientInfoPdu()
+            RdpLog.d("FALLBACK STEP 6: Client Info sent")
             handleDemandActivePdu()
+            RdpLog.d("FALLBACK STEP 7: Demand Active sequence complete")
             true
         } catch (e: Exception) {
-            Log.w(TAG, "Fallback connection failed: ${e.message}")
+            RdpLog.w("Fallback connection failed: ${e.message}", e)
             false
         }
     }
@@ -349,7 +369,7 @@ class RdpClient(
 
         outputStream?.write(buf.array())
         outputStream?.flush()
-        Log.d(TAG, "X.224 CR sent, length=$tpktLength, proto=0x${requestedProtocols.toString(16)}")
+        RdpLog.d("X.224 CR sent, length=$tpktLength, proto=0x${requestedProtocols.toString(16)}")
     }
 
     private fun readX224ConnectionConfirm(): Boolean {
@@ -381,14 +401,14 @@ class RdpClient(
                     serverSelectedProtocol = selected
                     negotiatedNla      = (selected and PROTOCOL_HYBRID) != 0
                     negotiatedHybridEx = (selected and PROTOCOL_HYBRID_EX) != 0
-                    Log.d(TAG, "Server selected: 0x${selected.toString(16)} (NLA=$negotiatedNla, HybridEX=$negotiatedHybridEx)")
+                    RdpLog.d("Server selected: 0x${selected.toString(16)} (NLA=$negotiatedNla, HybridEX=$negotiatedHybridEx)")
                 }
                 0x03 -> {
                     negotiationPresent = true
                     val failureCode = data.getOrElse(11) { 0 }.toInt() and 0xFF
                     throw RdpException(describeNegFailure(failureCode))
                 }
-                else -> Log.w(TAG, "Unrecognized X.224 negotiation type: 0x${negType.toString(16)}")
+                else -> RdpLog.w("Unrecognized X.224 negotiation type: 0x${negType.toString(16)}")
             }
         }
         return true
@@ -421,7 +441,7 @@ class RdpClient(
         sslSocketRef = sslSocket
         inputStream  = DataInputStream(BufferedInputStream(sslSocket.getInputStream(), 65536))
         outputStream = DataOutputStream(BufferedOutputStream(sslSocket.getOutputStream(), 65536))
-        Log.d(TAG, "TLS upgraded: ${sslSocket.session.protocol}")
+        RdpLog.d("TLS upgraded: ${sslSocket.session.protocol}")
     }
 
     // ── NLA / CredSSP ──────────────────────────────────────────────────────
@@ -459,11 +479,11 @@ class RdpClient(
     }
 
     private suspend fun performNlaAuthentication() {
-        Log.d(TAG, "Starting CredSSP/NTLMv2 auth")
+        RdpLog.d("Starting CredSSP/NTLMv2 auth")
 
         val negotiateMsg = NtlmHelper.buildNegotiateMessage(credentials.domain)
         sendRaw(CredSspHelper.buildNegotiateTsRequest(negotiateMsg))
-        Log.d(TAG, "NLA Step 1: NEGOTIATE sent")
+        RdpLog.d("NLA Step 1: NEGOTIATE sent")
 
         val challengeRequest = readRaw() ?: throw RdpAuthException("No CredSSP CHALLENGE response")
         CredSspHelper.extractErrorCode(challengeRequest)?.let { code ->
@@ -473,12 +493,12 @@ class RdpClient(
         val challengeMsg = CredSspHelper.extractNegoToken(challengeRequest)
             ?: throw RdpAuthException("Missing NTLM CHALLENGE token")
         val challenge = NtlmHelper.parseChallengeMessage(challengeMsg)
-        Log.d(TAG, "NLA Step 2: CHALLENGE received")
+        RdpLog.d("NLA Step 2: CHALLENGE received")
 
         val serverVersion = CredSspHelper.extractVersion(challengeRequest)
         if (serverVersion >= 5) {
             CredSspHelper.negotiatedCredSspVersion = serverVersion
-            Log.d(TAG, "CredSSP v$serverVersion (SHA256 mode, Windows 8+)")
+            RdpLog.d("CredSSP v$serverVersion (SHA256 mode, Windows 8+)")
         }
 
         val serverPublicKey = serverPublicKeyDer()
@@ -492,11 +512,11 @@ class RdpClient(
             challengeMessage = challengeMsg,
             serverSpn = "TERMSRV/${credentials.host}"  // FIX-M: Required for Windows 2019+ SPN enforcement
         )
-        Log.d(TAG, "NLA: AUTHENTICATE built")
+        RdpLog.d("NLA: AUTHENTICATE built")
 
         val pubKeyAuthToken = CredSspHelper.computePubKeyAuth(serverPublicKey, authResult.encryptionState, 0)
         sendRaw(CredSspHelper.buildAuthenticateTsRequest(authResult.message, pubKeyAuthToken))
-        Log.d(TAG, "NLA Step 3: AUTHENTICATE + pubKeyAuth sent")
+        RdpLog.d("NLA Step 3: AUTHENTICATE + pubKeyAuth sent")
 
         val pubKeyResponse = readRaw() ?: throw RdpAuthException(
             "No pubKeyAuth response – server closed the connection after credentials were sent " +
@@ -516,12 +536,12 @@ class RdpClient(
             sequenceNumber = 0
         )
         if (!verified) throw RdpAuthException("Server public key confirmation mismatch")
-        Log.d(TAG, "Server pubKeyAuth verified")
+        RdpLog.d("Server pubKeyAuth verified")
 
         val tsCredentials = CredSspHelper.buildTsCredentials(credentials.domain, credentials.username, credentials.password)
         val encryptedCreds = NtlmHelper.encryptMessage(authResult.encryptionState, tsCredentials, 1)
         sendRaw(CredSspHelper.buildAuthInfoTsRequest(encryptedCreds))
-        Log.d(TAG, "NLA Step 5: Encrypted credentials sent – CredSSP complete")
+        RdpLog.d("NLA Step 5: Encrypted credentials sent – CredSSP complete")
     }
 
     /**
@@ -543,10 +563,10 @@ class RdpClient(
                          ((buf[2].toInt() and 0xFF) shl 16) or
                          ((buf[1].toInt() and 0xFF) shl 8)  or
                           (buf[0].toInt() and 0xFF)
-            Log.d(TAG, "Early User Authorization Result: 0x${result.toString(16).padStart(8, '0')}")
+            RdpLog.d("Early User Authorization Result: 0x${result.toString(16).padStart(8, '0')}")
             result == 0x00000000  // only ACCESS_PERMITTED is success
         } catch (e: Exception) {
-            Log.w(TAG, "Early User Auth Result handling failed: ${e.message}")
+            RdpLog.w("Early User Auth Result handling failed: ${e.message}")
             true  // if we can't read it, assume permitted and continue
         }
     }
@@ -731,7 +751,7 @@ class RdpClient(
         val result = aucf[1].toInt() and 0xFF
         if (result != 0) throw RdpException("Attach User failed (result=$result)")
         mcsUserId = ((aucf[2].toInt() and 0xFF) shl 8) or (aucf[3].toInt() and 0xFF)
-        Log.d(TAG, "MCS user ID: $mcsUserId")
+        RdpLog.d("MCS user ID: $mcsUserId")
 
         joinChannel(mcsUserId + MCS_USER_BASE)
         joinChannel(ioChannelId)
@@ -836,7 +856,7 @@ class RdpClient(
                                         ((payload[8].toInt() and 0xFF) shl 16) or
                                         ((payload[7].toInt() and 0xFF) shl 8)  or
                                         (payload[6].toInt() and 0xFF)
-                        Log.d(TAG, "Demand Active: shareId=0x${serverShareId.toString(16)}")
+                        RdpLog.d("Demand Active: shareId=0x${serverShareId.toString(16)}")
                     }
                     foundDemandActive = true
                     break
@@ -844,24 +864,24 @@ class RdpClient(
             }
         }
         if (!foundDemandActive) {
-            Log.w(TAG, "Demand Active PDU not found; using default shareId=0x${serverShareId.toString(16)}")
+            RdpLog.w("Demand Active PDU not found; using default shareId=0x${serverShareId.toString(16)}")
         }
 
         // --- 2. Send our burst ---
         sendConfirmActivePdu()
-        Log.d(TAG, "PDU burst: Confirm Active sent")
+        RdpLog.d("PDU burst: Confirm Active sent")
 
         sendSynchronizePdu()
-        Log.d(TAG, "PDU burst: Synchronize sent")
+        RdpLog.d("PDU burst: Synchronize sent")
 
         sendControlPdu(CTRLACTION_COOPERATE)
-        Log.d(TAG, "PDU burst: Control COOPERATE sent")
+        RdpLog.d("PDU burst: Control COOPERATE sent")
 
         sendControlPdu(CTRLACTION_REQUEST_CONTROL)
-        Log.d(TAG, "PDU burst: Control REQUEST_CONTROL sent")
+        RdpLog.d("PDU burst: Control REQUEST_CONTROL sent")
 
         sendFontListPdu()
-        Log.d(TAG, "PDU burst: Font List sent")
+        RdpLog.d("PDU burst: Font List sent")
 
         // --- 3. Drain server's response burst ---
         // Server sends: Synchronize → Control(Cooperate) → Control(Granted) → Font Map
@@ -873,7 +893,7 @@ class RdpClient(
             val payload = stripMcsSendDataIndication(raw)
             if (payload.size >= 3) {
                 val pduType = payload[2].toInt() and 0xFF
-                Log.d(TAG, "Post-burst server PDU type=0x${pduType.toString(16)}")
+                RdpLog.d("Post-burst server PDU type=0x${pduType.toString(16)}")
                 if (pduType == PDU_TYPE_DATA) {
                     // Share Data Header pduType2 at payload offset ~26 (rough heuristic)
                     // We just drain without strict parsing; 4 PDUs is the expected count.
@@ -882,7 +902,7 @@ class RdpClient(
                 }
             }
         }
-        Log.d(TAG, "Post-burst drain complete ($drained PDUs consumed)")
+        RdpLog.d("Post-burst drain complete ($drained PDUs consumed)")
     }
 
     // ── Confirm Active PDU ────────────────────────────────────────────────
@@ -1212,7 +1232,7 @@ class RdpClient(
             } catch (e: CancellationException) { break
             } catch (e: Exception) {
                 consecutiveErrors++
-                Log.w(TAG, "Receive error ($consecutiveErrors): ${e.message}")
+                RdpLog.w("Receive error ($consecutiveErrors): ${e.message}")
                 if (consecutiveErrors > 5) {
                     _sessionState.emit(RdpSessionState.ERROR)
                     _error.emit("Connection lost: ${e.message}")
@@ -1257,7 +1277,7 @@ class RdpClient(
                 val pduType = payload[2].toInt() and 0xFF
                 when (pduType) {
                     PDU_TYPE_DEMAND_ACTIVE -> {
-                        Log.d(TAG, "Reactivation: new Demand Active received")
+                        RdpLog.d("Reactivation: new Demand Active received")
                         handleDemandActivePdu()
                     }
                     else -> Log.v(TAG, "Unhandled MCS PDU type: 0x${pduType.toString(16)}")
@@ -1361,7 +1381,7 @@ class RdpClient(
             writeFastPathLength(header, data.size + 2)
             val packet = header.array().copyOf(header.position()) + data
             synchronized(outputStream!!) { outputStream?.write(packet); outputStream?.flush() }
-        } catch (e: Exception) { Log.w(TAG, "Failed to send input: ${e.message}") }
+        } catch (e: Exception) { RdpLog.w("Failed to send input: ${e.message}") }
     }
 
     private fun writeFastPathLength(buf: ByteBuffer, length: Int) {
@@ -1418,7 +1438,7 @@ class RdpClient(
                 byteArrayOf(0x30, firstLenByte.toByte()) + lenBytes
             }
             header + content
-        } catch (e: Exception) { Log.w(TAG, "readRaw failed: ${e.message}"); null }
+        } catch (e: Exception) { RdpLog.w("readRaw failed: ${e.message}"); null }
     }
 
     private fun readTpkt(): ByteArray? {
@@ -1466,7 +1486,7 @@ class RdpClient(
 
     private fun cleanup() {
         try { outputStream?.close(); inputStream?.close(); socket?.close() }
-        catch (e: Exception) { Log.w(TAG, "Cleanup error: ${e.message}") }
+        catch (e: Exception) { RdpLog.w("Cleanup error: ${e.message}") }
         socket = null; inputStream = null; outputStream = null
     }
 }
