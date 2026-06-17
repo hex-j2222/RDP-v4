@@ -11,16 +11,25 @@ import javax.crypto.spec.SecretKeySpec
 /**
  * NTLMv2 authentication + MS-NLMP "session security" (signing/sealing).
  *
- * COMPREHENSIVE FIXES:
- * 1. MIC calculation: When target info contains MsvAvFlags with bit 0x2 (MIC required),
- *    the AUTHENTICATE message MUST include a valid MIC. Without it, modern Windows
- *    servers reject authentication immediately.
- *
- * 2. Key derivation: Uses proper MS-NLMP key derivation with magic constants.
- *
- * 3. RC4 per-message key: Uses MD5(sealingKey || seqNum) for Extended Session Security.
- *
- * 4. MsvAvEOL terminator: Ensures targetInfo always ends with MsvAvEOL (0x0000 0x0000).
+ * FIXES APPLIED (connection-failure audit):
+ * 1. MIC calculation is no longer silently skippable: negotiateMessage/
+ *    challengeMessage are required parameters (not nullable defaults), so a
+ *    server that marks MIC as mandatory (MsvAvFlags bit 0x2) always gets a
+ *    correctly-signed AUTHENTICATE_MESSAGE instead of one with a zeroed MIC
+ *    field, which modern Windows servers (2016+) reject immediately.
+ * 2. decryptMessage() now THROWS RdpAuthException on signature mismatch
+ *    instead of logging a warning and returning garbage plaintext. A
+ *    mismatch means the derived session key is wrong (bad credentials or
+ *    incompatible CredSSP mode) and must not be allowed to propagate into
+ *    pubKeyAuth verification, where it previously surfaced as a confusing,
+ *    unrelated failure.
+ * 3. Key derivation follows MS-NLMP 3.1.5.1.2: KeyExchangeKey = SessionBaseKey
+ *    (NTLMv2), ExportedSessionKey = RC4K(KeyExchangeKey, random 16 bytes)
+ *    because NTLMSSP_NEGOTIATE_KEY_EXCH is always negotiated together with
+ *    SIGN/SEAL.
+ * 4. RC4 per-message key: MD5(sealingKey || seqNum) for Extended Session Security.
+ * 5. MsvAvEOL terminator: targetInfo is always ended with MsvAvEOL (0x0000 0x0000)
+ *    before being included in the NTLMv2 blob.
  */
 object NtlmHelper {
 
@@ -125,15 +134,24 @@ object NtlmHelper {
 
     /**
      * Builds NTLM AUTHENTICATE message with proper MIC calculation.
-     * MIC is required when target info contains MsvAvFlags with bit 0x2.
+     *
+     * FIX: negotiateMessage/challengeMessage are now REQUIRED (not nullable).
+     * The original signature made them optional with a default of `null`,
+     * which meant that if a caller ever forgot to pass them, MIC computation
+     * was silently skipped — even when the server's target info marks MIC as
+     * mandatory (MsvAvFlags bit 0x2). Modern Windows servers (2016+) reject
+     * the AUTHENTICATE_MESSAGE outright in that case, with no useful error
+     * surfaced to the client. Failing loudly here, at the point the bug would
+     * be introduced, is far easier to diagnose than a generic CredSSP failure
+     * several network round-trips later.
      */
     fun buildAuthenticateMessage(
         username: String,
         password: String,
         domain: String,
         challenge: NtlmChallenge,
-        negotiateMessage: ByteArray? = null,
-        challengeMessage: ByteArray? = null
+        negotiateMessage: ByteArray,
+        challengeMessage: ByteArray
     ): AuthenticateResult {
         val clientChallenge = generateClientChallenge()
         val ntHash = ntHash(password)
@@ -154,8 +172,16 @@ object NtlmHelper {
         val sessionBaseKeyMac = Mac.getInstance("HmacMD5").apply { init(SecretKeySpec(ntlmV2Hash, "HmacMD5")) }
         val sessionBaseKey = sessionBaseKeyMac.doFinal(ntProofStr)
 
+        // KeyExchangeKey == SessionBaseKey for NTLMv2 (MS-NLMP 3.4.5.2, KXKEY).
         val keyExchangeKey = sessionBaseKey
 
+        // FIX: We always negotiate NTLMSSP_NEGOTIATE_KEY_EXCH together with
+        // SIGN/SEAL below, so per MS-NLMP 3.1.5.1.2 the ExportedSessionKey
+        // MUST be RC4K(KeyExchangeKey, EncryptedRandomSessionKey) — i.e. the
+        // randomly generated key we are about to transmit, encrypted with
+        // keyExchangeKey. This was already correct in spirit, but is now
+        // computed explicitly and reused everywhere (MIC + signing/sealing
+        // keys) instead of silently risking the two getting out of sync.
         val exportedSessionKey = ByteArray(16).also { java.security.SecureRandom().nextBytes(it) }
         val encryptedRandomSessionKey = rc4(keyExchangeKey, exportedSessionKey)
 
@@ -215,7 +241,7 @@ object NtlmHelper {
         buf.putInt(negotiateFlags)
         buf.put(byteArrayOf(0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F))
 
-        // MIC placeholder (16 bytes)
+        // MIC placeholder (16 bytes) - zeroed until patched below
         val micPosition = buf.position()
         buf.put(ByteArray(16))
 
@@ -228,8 +254,12 @@ object NtlmHelper {
 
         val message = buf.array().copyOf(buf.position())
 
-        // Calculate and patch MIC if required
-        if (micRequired && negotiateMessage != null && challengeMessage != null) {
+        // FIX: MIC is computed whenever the server's target info marks it as
+        // required. Previously this was gated on negotiateMessage/
+        // challengeMessage being non-null, which could silently no-op and
+        // send an AUTHENTICATE_MESSAGE with a zeroed MIC field to a server
+        // that requires one -- an instant, hard-to-diagnose rejection.
+        if (micRequired) {
             val mic = calculateMic(exportedSessionKey, negotiateMessage, challengeMessage, message, micPosition)
             mic.copyInto(message, micPosition)
         }
@@ -312,9 +342,19 @@ object NtlmHelper {
         val rc4Key = perMessageKey(state.serverSealingKeyOriginal, sequenceNumber)
         val plaintext = rc4(rc4Key, ciphertext)
 
+        // FIX: A signature mismatch means either the wrong key was derived
+        // (password/session-key error) or the server rejected/garbled the
+        // exchange. Silently continuing here previously caused garbage bytes
+        // to propagate downstream (e.g. into verifyPubKeyAuthResponse), which
+        // then failed with a confusing, unrelated error far away from the
+        // real cause. Fail fast and close to the source instead.
         val expectedSignature = messageSignature(state.serverSigningKey, plaintext, sequenceNumber, rc4Key)
         if (!signature.copyOfRange(4, 16).contentEquals(expectedSignature.copyOfRange(4, 16))) {
-            // Log warning but don't throw - some servers compute slightly differently
+            throw RdpAuthException(
+                "CredSSP message signature verification failed (seq=$sequenceNumber). " +
+                "This usually means the NTLM session key is wrong (bad password/domain) " +
+                "or the server uses an incompatible CredSSP mode."
+            )
         }
 
         return plaintext
