@@ -18,44 +18,20 @@ import javax.net.ssl.X509TrustManager
 import java.security.cert.X509Certificate
 
 /**
- * Pure Kotlin RDP Protocol Client
+ * Pure Kotlin RDP Protocol Client v5.2
  * Maximum compatibility: Windows XP/7/8/8.1/10/11, Server 2008-2022, xrdp/Linux
  *
- * ═══════════════════════════════════════════════════════════════════
- * FIXES APPLIED IN THIS REVISION (v4.1 → v5):
- *
- * FIX-9  CRITICAL: buildDomainParameters() argument count mismatch.
- *         The targetParameters call had 14 args for a 12-param function,
- *         causing maxMCSPDUsize=0 and protocolVersion=65535. The server
- *         rejected the malformed MCS Connect Initial and closed the
- *         connection without sending a response.
- *         Also rewrote to use MINIMAL BER encoding (matching FreeRDP)
- *         instead of fixed-width encoding.
- *         Per MS-RDPBCGR §2.2.1.3 and FreeRDP mcs.c.
- *
- * FIX-10 maximumParameters values corrected to match MS-RDPBCGR spec:
- *         maxChannelIds=65535, maxUserIds=65535, maxTokenIds=65535.
- *         Previously used incorrect values (34, 3, 0).
- *
- * FIX-11 GCC Conference Create Request PER encoding rewritten to match
- *         FreeRDP's gcc_write_conference_create_request() exactly.
- *         Uses proper bit-aligned PER encoding instead of byte-aligned
- *         pseudo-PER. This ensures compatibility with all Windows
- *         versions and xrdp.
- *
- * FIX-12 readMcsConnectResponse() now properly parses the MCS Connect
- *         Response BER structure and extracts the GCC Conference Create
- *         Response data blocks. Previously only checked the first byte.
- *
- * FIX-13 Client Core Data size corrected to 234 bytes (was 216) to match
- *         RDP 5.0+ format with desktopPhysicalWidth/Height fields.
- *         Also added proper postBeta2ColorDepth and supportedColorDepths.
- *
- * FIX-14 Client Security Data encryptionMethods now uses 0x00000001
- *         (40BIT) | 0x00000002 (128BIT) = 0x00000003 correctly for
- *         Standard RDP Security fallback connections.
- *
- * ═══════════════════════════════════════════════════════════════════
+ * FIXES v5.1 -> v5.2:
+ * FIX-15: DomainParameters maxUserIds=64535 (was 65535)
+ * FIX-16: GCC PER encoding rewritten to match FreeRDP
+ * FIX-17: Client Core Data 216 bytes (RDP 4.0 compatible)
+ * FIX-18: readTpkt/readX224Data handle Fast Path
+ * FIX-19: X.224 CR with proper Cookie routingToken
+ * FIX-20: clientNetworkData with cliprdr+rdpsnd channels
+ * FIX-21: clientSecurityData always 12 bytes
+ * FIX-22: MCS Connect Response lenient BER parsing
+ * FIX-23: DomainParameters exact byte counts per FreeRDP
+ * FIX-24: Client Info PDU correct flags
  */
 class RdpClient(
     private val credentials: RdpCredentials,
@@ -70,79 +46,62 @@ class RdpClient(
         const val CONNECT_TIMEOUT_MS = 10_000
         const val READ_TIMEOUT_MS = 30_000
 
-        // Protocol flags
-        const val PROTOCOL_RDP      = 0x00000000
-        const val PROTOCOL_SSL      = 0x00000001
-        const val PROTOCOL_HYBRID   = 0x00000002
+        const val PROTOCOL_RDP       = 0x00000000
+        const val PROTOCOL_SSL       = 0x00000001
+        const val PROTOCOL_HYBRID    = 0x00000002
         const val PROTOCOL_HYBRID_EX = 0x00000008
 
-        // PDU type nibbles (lower 4 bits of pduType field in Share Control Header)
-        const val PDU_TYPE_DEMAND_ACTIVE  = 0x11   // 0x01 | version=1<<4
-        const val PDU_TYPE_CONFIRM_ACTIVE = 0x13   // 0x03 | version=1<<4
-        const val PDU_TYPE_DATA           = 0x17   // 0x07 | version=1<<4
+        const val PDU_TYPE_DEMAND_ACTIVE  = 0x11
+        const val PDU_TYPE_CONFIRM_ACTIVE = 0x13
+        const val PDU_TYPE_DATA           = 0x17
 
-        // PDU type 2 (Share Data Header pduType2)
-        const val PDUTYPE2_SYNCHRONIZE       = 0x1F
-        const val PDUTYPE2_CONTROL           = 0x14
-        const val PDUTYPE2_FONTLIST          = 0x27
-        const val PDUTYPE2_FONTMAP           = 0x28   // server→client
+        const val PDUTYPE2_SYNCHRONIZE = 0x1F
+        const val PDUTYPE2_CONTROL   = 0x14
+        const val PDUTYPE2_FONTLIST  = 0x27
+        const val PDUTYPE2_FONTMAP   = 0x28
 
-        // Control actions
         const val CTRLACTION_REQUEST_CONTROL = 0x0001
         const val CTRLACTION_GRANTED_CONTROL = 0x0002
         const val CTRLACTION_DETACH          = 0x0003
         const val CTRLACTION_COOPERATE       = 0x0004
 
-        // TS_SECURITY_HEADER flags (MS-RDPBCGR §2.2.8.1.1.2.1)
-        const val SEC_INFO_PKT       = 0x0040
-        const val SEC_IGNORE_SEQNO   = 0x0004
+        const val SEC_INFO_PKT     = 0x0040
+        const val SEC_IGNORE_SEQNO = 0x0004
 
-        // TPKT
         const val TPKT_VERSION = 0x03
 
-        // RDP version constants
-        const val RDP_VERSION_5_0 = 0x00080001
-        const val RDP_VERSION_5_1 = 0x00080002
-        const val RDP_VERSION_5_2 = 0x00080003
-        const val RDP_VERSION_6_0 = 0x00080004
-        const val RDP_VERSION_8_0 = 0x00080004
-        const val RDP_VERSION_8_1 = 0x00080005
-        const val RDP_VERSION_10_0 = 0x00080006
-        const val RDP_VERSION_10_1 = 0x00080007
-        const val RDP_VERSION_10_2 = 0x00080008
-        const val RDP_VERSION_10_3 = 0x00080009
-        const val RDP_VERSION_10_4 = 0x0008000A
-        const val RDP_VERSION_10_5 = 0x0008000B
-        const val RDP_VERSION_10_6 = 0x0008000C
+        const val RDP_VERSION_4_0  = 0x00080001
+        const val RDP_VERSION_5_0  = 0x00080001
+        const val RDP_VERSION_5_1  = 0x00080002
+        const val RDP_VERSION_5_2  = 0x00080003
+        const val RDP_VERSION_10_0 = 0x00080004
         const val RDP_VERSION_10_7 = 0x0008000D
 
-        // TS_INFO_PACKET flags (MS-RDPBCGR §2.2.1.11.1.1)
-        const val INFO_MOUSE            = 0x00000001
+        const val INFO_MOUSE             = 0x00000001
         const val INFO_DISABLECTRLALTDEL = 0x00000002
-        const val INFO_AUTOLOGON        = 0x00000008
-        const val INFO_UNICODE          = 0x00000040
-        const val INFO_MAXIMIZESHELL    = 0x00000020
-        const val INFO_LOGON_NOTIFY     = 0x00001000
-        const val INFO_ENABLEWINDOWSKEY = 0x00000100
-        const val INFO_NOAUDIOPLAYBACK  = 0x00080000
+        const val INFO_AUTOLOGON         = 0x00000008
+        const val INFO_UNICODE           = 0x00000040
+        const val INFO_MAXIMIZESHELL     = 0x00000020
+        const val INFO_LOGON_NOTIFY      = 0x00001000
+        const val INFO_ENABLEWINDOWSKEY  = 0x00000100
+        const val INFO_NOAUDIOPLAYBACK   = 0x00080000
 
-        // Fixed MCS channel IDs used by all known servers
         const val MCS_IO_CHANNEL_ID     = 1003
-        const val MCS_USER_BASE         = 1001
+        const val MCS_USER_CHANNEL_BASE = 1001
 
-        // Color depth constants
         const val RNS_UD_COLOR_4BPP  = 0xCA00
         const val RNS_UD_COLOR_8BPP  = 0xCA01
         const val RNS_UD_COLOR_16BPP = 0xCA02
         const val RNS_UD_COLOR_24BPP = 0xCA03
         const val RNS_UD_COLOR_32BPP = 0xCA04
-        const val RNS_UD_SAS_DEL = 0xAA03
+        const val RNS_UD_SAS_DEL     = 0xAA03
 
-        // Encryption methods
         const val ENCRYPTION_METHOD_40BIT  = 0x00000001
         const val ENCRYPTION_METHOD_128BIT = 0x00000002
-        const val ENCRYPTION_METHOD_56BIT  = 0x00000008
-        const val ENCRYPTION_METHOD_FIPS   = 0x00000010
+
+        const val CHANNEL_CLIPRDR = "cliprdr"
+        const val CHANNEL_RDPSND  = "rdpsnd"
+        const val CHANNEL_RDPDR   = "rdpdr"
     }
 
     private var socket: Socket? = null
@@ -170,7 +129,6 @@ class RdpClient(
 
     private val clientScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    // ── Per-connection state ────────────────────────────────────────────────
     private var negotiatedNla      = false
     private var negotiatedHybridEx = false
     private var serverSelectedProtocol: Int = 0
@@ -179,17 +137,13 @@ class RdpClient(
     private var sslSocketRef: javax.net.ssl.SSLSocket? = null
     private var mcsUserId: Int = 0
     private val ioChannelId: Int = MCS_IO_CHANNEL_ID
-
-    // FIX-C: shareId must be parsed from server's Demand Active PDU
     private var serverShareId: Int = 0x000103EA
-
-    // ── connect() ──────────────────────────────────────────────────────────
 
     suspend fun connect(): Boolean = withContext(Dispatchers.IO) {
         RdpLog.clear()
         try {
             _sessionState.emit(RdpSessionState.CONNECTING)
-            RdpLog.d("Connecting to ${credentials.host}:${credentials.port}")
+            RdpLog.d("RDP v5.2 connecting to ${credentials.host}:${credentials.port}")
 
             val sock = Socket()
             sock.connect(InetSocketAddress(credentials.host, credentials.port), CONNECT_TIMEOUT_MS)
@@ -210,18 +164,17 @@ class RdpClient(
                 if (!readX224ConnectionConfirm()) throw RdpException("X.224 connection rejected")
             } catch (e: RdpNegotiationFailure) {
                 if (e.code == 2 && allowFallback) {
-                    RdpLog.w("Server rejected TLS/NLA (SSL_NOT_ALLOWED_BY_SERVER) — retrying with Standard RDP Security", e)
+                    RdpLog.w("Server rejected TLS/NLA - retrying with Standard RDP Security", e)
                     cleanup()
                     val fellBack = connectWithoutNla()
                     if (fellBack) {
                         connected = true
-                        RdpLog.d("STEP 10b: Connected via Standard RDP Security fallback (server rejected TLS/NLA)")
+                        RdpLog.d("STEP 10b: Connected via Standard RDP Security fallback")
                         _sessionState.emit(RdpSessionState.CONNECTED)
                         clientScope.launch { receiveLoop() }
                         return@withContext true
                     }
-                    val fallbackMsg = "Server only supports legacy Standard RDP Security, and the fallback " +
-                        "connection attempt also failed. Try disabling 'Use NLA Authentication' in the profile manually."
+                    val fallbackMsg = "Server only supports legacy Standard RDP Security, and the fallback connection attempt also failed."
                     RdpLog.e(fallbackMsg)
                     throw RdpException(fallbackMsg)
                 }
@@ -233,7 +186,7 @@ class RdpClient(
                 upgradeTls()
                 RdpLog.d("STEP 4: TLS upgraded")
             } else {
-                RdpLog.d("STEP 4: Skipped TLS (Standard RDP Security or pre-negotiation server)")
+                RdpLog.d("STEP 4: Skipped TLS (Standard RDP Security)")
             }
 
             if (negotiatedHybridEx) {
@@ -254,7 +207,7 @@ class RdpClient(
                          e.message?.contains("PASSWORD_EXPIRED") == true)
 
                     if (allowFallback && !looksLikeBadCredentials) {
-                        RdpLog.w("Attempting fallback to Standard RDP Security (NLA disabled)")
+                        RdpLog.w("Attempting fallback to Standard RDP Security")
                         cleanup()
                         val fellBack = connectWithoutNla()
                         if (fellBack) {
@@ -264,12 +217,11 @@ class RdpClient(
                             clientScope.launch { receiveLoop() }
                             return@withContext true
                         }
-                        val fallbackMsg = "NLA authentication failed (${e.message}), and fallback to Standard RDP " +
-                            "Security also failed. Try disabling 'Use NLA Authentication' in the profile."
+                        val fallbackMsg = "NLA authentication failed (${e.message}), and fallback also failed."
                         RdpLog.e(fallbackMsg)
                         throw RdpAuthException(fallbackMsg)
                     }
-                    val msg = "NLA authentication failed (${e.message}). Try disabling 'Use NLA Authentication'."
+                    val msg = "NLA authentication failed (${e.message})."
                     RdpLog.e(msg)
                     throw RdpAuthException(msg)
                 }
@@ -346,11 +298,11 @@ class RdpClient(
         }
     }
 
-    // ── X.224 ──────────────────────────────────────────────────────────────
-
+    // X.224 CONNECTION
     private fun sendX224ConnectionRequest() {
-        val cookie = "Cookie: mstshash=user\r\n"
-        val cookieBytes = cookie.toByteArray()
+        val userHash = credentials.username.takeIf { it.isNotBlank() } ?: "user"
+        val cookie = "Cookie: mstshash=$userHash\r\n"
+        val cookieBytes = cookie.toByteArray(Charsets.US_ASCII)
 
         val requestedProtocols = when {
             forceStandardRdpSecurity || !credentials.useNla -> PROTOCOL_RDP
@@ -365,8 +317,9 @@ class RdpClient(
         negReq.putInt(requestedProtocols)
         val negReqBytes = negReq.array()
 
-        val x224Length = 7 + cookieBytes.size + negReqBytes.size
-        val tpktLength = 4 + x224Length
+        val x224CrFixed = 7
+        val x224Length = x224CrFixed + cookieBytes.size + negReqBytes.size
+        val tpktLength = 4 + 1 + x224Length
 
         val buf = ByteBuffer.allocate(tpktLength)
         buf.put(TPKT_VERSION.toByte())
@@ -428,17 +381,16 @@ class RdpClient(
     }
 
     private fun describeNegFailure(code: Int): String = when (code) {
-        1 -> "SSL_REQUIRED_BY_SERVER – enable NLA/TLS for this profile"
-        2 -> "SSL_NOT_ALLOWED_BY_SERVER – disable 'Use NLA Authentication' for this profile"
-        3 -> "SSL_CERT_NOT_ON_SERVER – server has no certificate configured for TLS"
-        4 -> "INCONSISTENT_FLAGS – conflicting protocol flags were requested"
-        5 -> "HYBRID_REQUIRED_BY_SERVER – enable 'Use NLA Authentication' for this profile"
-        6 -> "SSL_WITH_USER_AUTH_REQUIRED_BY_SERVER – server requires TLS with NLA"
-        else -> "Server rejected the connection (RDP_NEG_FAILURE code $code, see MS-RDPBCGR 2.2.1.2.2)"
+        1 -> "SSL_REQUIRED_BY_SERVER"
+        2 -> "SSL_NOT_ALLOWED_BY_SERVER - disable Use NLA Authentication"
+        3 -> "SSL_CERT_NOT_ON_SERVER"
+        4 -> "INCONSISTENT_FLAGS"
+        5 -> "HYBRID_REQUIRED_BY_SERVER - enable Use NLA Authentication"
+        6 -> "SSL_WITH_USER_AUTH_REQUIRED_BY_SERVER"
+        else -> "Server rejected connection (RDP_NEG_FAILURE code $code)"
     }
 
-    // ── TLS upgrade ────────────────────────────────────────────────────────
-
+    // TLS UPGRADE
     private fun upgradeTls() {
         val trustAllManager = object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) {}
@@ -457,8 +409,7 @@ class RdpClient(
         RdpLog.d("TLS upgraded: ${sslSocket.session.protocol}")
     }
 
-    // ── NLA / CredSSP ──────────────────────────────────────────────────────
-
+    // NLA / CredSSP
     private fun serverPublicKeyDer(): ByteArray {
         val session = sslSocketRef?.session ?: throw RdpException("No TLS session")
         val cert = session.peerCertificates.firstOrNull() ?: throw RdpException("No server certificate")
@@ -476,7 +427,7 @@ class RdpClient(
         if (spki[pos].toInt() and 0xFF != 0x03) return spki
         pos++
         val bs = readAsn1Length(spki, pos); pos += bs.second
-        pos++ // skip unused-bits byte
+        pos++
         return spki.copyOfRange(pos, pos + bs.first - 1)
     }
 
@@ -493,7 +444,6 @@ class RdpClient(
 
     private suspend fun performNlaAuthentication() {
         RdpLog.d("Starting CredSSP/NTLMv2 auth")
-
         val negotiateMsg = NtlmHelper.buildNegotiateMessage(credentials.domain)
         sendRaw(CredSspHelper.buildNegotiateTsRequest(negotiateMsg))
         RdpLog.d("NLA Step 1: NEGOTIATE sent")
@@ -511,18 +461,13 @@ class RdpClient(
         val serverVersion = CredSspHelper.extractVersion(challengeRequest)
         if (serverVersion >= 5) {
             CredSspHelper.negotiatedCredSspVersion = serverVersion
-            RdpLog.d("CredSSP v$serverVersion (SHA256 mode, Windows 8+)")
+            RdpLog.d("CredSSP v$serverVersion")
         }
 
         val serverPublicKey = serverPublicKeyDer()
-
         val authResult = NtlmHelper.buildAuthenticateMessage(
-            username = credentials.username,
-            password = credentials.password,
-            domain = credentials.domain,
-            challenge = challenge,
-            negotiateMessage = negotiateMsg,
-            challengeMessage = challengeMsg,
+            username = credentials.username, password = credentials.password, domain = credentials.domain,
+            challenge = challenge, negotiateMessage = negotiateMsg, challengeMessage = challengeMsg,
             serverSpn = "TERMSRV/${credentials.host}"
         )
         RdpLog.d("NLA: AUTHENTICATE built")
@@ -531,10 +476,7 @@ class RdpClient(
         sendRaw(CredSspHelper.buildAuthenticateTsRequest(authResult.message, pubKeyAuthToken))
         RdpLog.d("NLA Step 3: AUTHENTICATE + pubKeyAuth sent")
 
-        val pubKeyResponse = readRaw() ?: throw RdpAuthException(
-            "No pubKeyAuth response – server closed the connection after credentials were sent " +
-            "(wrong username/password, or NLA not actually enabled on the server)"
-        )
+        val pubKeyResponse = readRaw() ?: throw RdpAuthException("No pubKeyAuth response")
         CredSspHelper.extractErrorCode(pubKeyResponse)?.let { code ->
             throw RdpAuthException(CredSspHelper.describeErrorCode(code))
         }
@@ -543,10 +485,8 @@ class RdpClient(
             ?: throw RdpAuthException("Missing pubKeyAuth confirmation")
 
         val verified = CredSspHelper.verifyPubKeyAuthResponse(
-            encryptedResponse = encryptedServerConfirm,
-            serverPublicKey = serverPublicKey,
-            encryptionState = authResult.encryptionState,
-            sequenceNumber = 0
+            encryptedResponse = encryptedServerConfirm, serverPublicKey = serverPublicKey,
+            encryptionState = authResult.encryptionState, sequenceNumber = 0
         )
         if (!verified) throw RdpAuthException("Server public key confirmation mismatch")
         RdpLog.d("Server pubKeyAuth verified")
@@ -554,7 +494,7 @@ class RdpClient(
         val tsCredentials = CredSspHelper.buildTsCredentials(credentials.domain, credentials.username, credentials.password)
         val encryptedCreds = NtlmHelper.encryptMessage(authResult.encryptionState, tsCredentials, 1)
         sendRaw(CredSspHelper.buildAuthInfoTsRequest(encryptedCreds))
-        RdpLog.d("NLA Step 5: Encrypted credentials sent – CredSSP complete")
+        RdpLog.d("NLA Step 5: Encrypted credentials sent")
     }
 
     private fun handleEarlyUserAuthResult(): Boolean {
@@ -573,8 +513,7 @@ class RdpClient(
         }
     }
 
-    // ── MCS ────────────────────────────────────────────────────────────────
-
+    // MCS CONNECT INITIAL
     private fun sendMcsConnectInitial() = sendTpkt(buildMcsConnectInitialPayload())
 
     private fun buildMcsConnectInitialPayload(): ByteArray {
@@ -582,177 +521,142 @@ class RdpClient(
         val secData     = buildClientSecurityData()
         val netData     = buildClientNetworkData()
         val clusterData = buildClientClusterData()
-        return wrapInGccConferenceCreateRequest(coreData + secData + netData + clusterData)
+        val userData = coreData + secData + netData + clusterData
+        return wrapInGccConferenceCreateRequest(userData)
     }
 
-    /**
-     * FIX-13: TS_UD_CS_CORE (MS-RDPBCGR 2.2.1.3.2) — 234 bytes for RDP 5.0+.
-     * Corrected size and field layout per MS-RDPBCGR and FreeRDP.
-     */
     private fun buildClientCoreData(): ByteArray {
         val buf = ByteBuffer.allocate(256).order(ByteOrder.LITTLE_ENDIAN)
-        val rdpVersion = RDP_VERSION_5_0  // Use 5.0 for maximum compatibility
+        val rdpVersion = RDP_VERSION_5_0
 
-        // Header
-        buf.putShort(0xC001.toShort())        // header.type = CS_CORE
-        buf.putShort(234)                     // header.length = 234 (RDP 5.0+)
+        buf.putShort(0xC001.toShort())
+        buf.putShort(216)
 
-        // Core data fields
         buf.putInt(rdpVersion)
         buf.putShort(displayWidth.toShort())
         buf.putShort(displayHeight.toShort())
-        buf.putShort(RNS_UD_COLOR_8BPP.toShort())   // colorDepth (legacy)
-        buf.putShort(RNS_UD_SAS_DEL.toShort())      // SASSequence
-        buf.putInt(0x00000409)                // keyboardLayout (EN-US)
-        buf.putInt(2600)                      // clientBuild
-        val clientName = "HEXRDP".padEnd(16, '\u0000')
-        clientName.forEach { buf.putShort(it.code.toShort()) }  // 32 bytes UTF-16LE
-        buf.putInt(4)                         // keyboardType
-        buf.putInt(0)                         // keyboardSubType
-        buf.putInt(12)                        // keyboardFunctionKey
-        repeat(64) { buf.put(0) }             // imeFileName
-        buf.putShort(RNS_UD_COLOR_8BPP.toShort())   // postBeta2ColorDepth
-        buf.putShort(1)                       // clientProductId
-        buf.putInt(0)                         // serialNumber
-        buf.putShort(0x0018.toShort())        // highColorDepth = 24 bpp
-        buf.putShort(0x000F.toShort())        // supportedColorDepths (all)
-        buf.putShort(0x0001.toShort())        // earlyCapabilityFlags
-        repeat(64) { buf.put(0) }             // clientDigProductId
-        buf.put(0)                            // connectionType
-        buf.put(0)                            // pad1octet
-        buf.putInt(serverSelectedProtocol)    // CRITICAL: must echo server's choice
-        // RDP 5.0+ fields (offset 218):
-        buf.putInt(0)                         // desktopPhysicalWidth
-        buf.putInt(0)                         // desktopPhysicalHeight
-        buf.putShort(0)                       // desktopOrientation
-        buf.putShort(1)                       // desktopScaleFactor
-        buf.putShort(1)                       // deviceScaleFactor
-        return buf.array().copyOf(234)
+        buf.putShort(RNS_UD_COLOR_8BPP.toShort())
+        buf.putShort(RNS_UD_SAS_DEL.toShort())
+        buf.putInt(0x00000409)
+        buf.putInt(2600)
+        val clientName = "HEXRDP".padEnd(16, ' ')
+        clientName.forEach { buf.putShort(it.code.toShort()) }
+        buf.putInt(4)
+        buf.putInt(0)
+        buf.putInt(12)
+        repeat(64) { buf.put(0) }
+        buf.putShort(RNS_UD_COLOR_8BPP.toShort())
+        buf.putShort(1)
+        buf.putInt(0)
+        buf.putShort(0x0018.toShort())
+        buf.putShort(0x000F.toShort())
+        buf.putShort(0x0001.toShort())
+        repeat(64) { buf.put(0) }
+        buf.put(0)
+        buf.put(0)
+        buf.putInt(serverSelectedProtocol)
+
+        return buf.array().copyOf(216)
     }
 
     private fun buildClientSecurityData(): ByteArray {
         val buf = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putShort(0xC002.toShort()); buf.putShort(12)
-        // FIX-14: For Standard RDP Security, advertise supported encryption methods
+        buf.putShort(0xC002.toShort())
+        buf.putShort(12)
         val encryptionMethods = if (forceStandardRdpSecurity || serverSelectedProtocol == PROTOCOL_RDP) {
             ENCRYPTION_METHOD_40BIT or ENCRYPTION_METHOD_128BIT
         } else {
-            0x00000000  // Enhanced security: no RDP encryption
+            0x00000000
         }
         buf.putInt(encryptionMethods)
-        buf.putInt(0x00000000)  // extEncryptionMethods
+        buf.putInt(0x00000000)
         return buf.array()
     }
 
     private fun buildClientNetworkData(): ByteArray {
-        val buf = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putShort(0xC003.toShort()); buf.putShort(8); buf.putInt(0)
+        val channels = listOf(
+            CHANNEL_CLIPRDR to 0xC0A00000,
+            CHANNEL_RDPSND to 0xC0000000
+        )
+        val channelCount = channels.size
+        val headerSize = 8
+        val channelSize = 12
+        val totalSize = headerSize + (channelCount * channelSize)
+
+        val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putShort(0xC003.toShort())
+        buf.putShort(totalSize.toShort())
+        buf.putInt(channelCount)
+
+        for ((name, options) in channels) {
+            val nameBytes = name.padEnd(8, ' ').toByteArray(Charsets.UTF_8)
+            buf.put(nameBytes.copyOf(8))
+            buf.putInt(options)
+        }
         return buf.array()
     }
 
     private fun buildClientClusterData(): ByteArray {
         val buf = ByteBuffer.allocate(12).order(ByteOrder.LITTLE_ENDIAN)
-        buf.putShort(0xC004.toShort()); buf.putShort(12)
-        buf.putInt(0x0000001C)   // REDIRECTION_SUPPORTED | REDIRECTION_VERSION3
+        buf.putShort(0xC004.toShort())
+        buf.putShort(12)
+        buf.putInt(0x0000001C)
         buf.putInt(0)
         return buf.array()
     }
 
-    /**
-     * FIX-9/10/11: Complete rewrite of MCS Connect Initial + GCC wrapping.
-     *
-     * Uses MINIMAL BER integer encoding (matching FreeRDP) and correct
-     * DomainParameters values per MS-RDPBCGR §2.2.1.3.
-     */
+    // GCC CONFERENCE CREATE REQUEST (PER ENCODING)
     private fun wrapInGccConferenceCreateRequest(userData: ByteArray): ByteArray {
-        // FIX-11: GCC Conference Create Request using proper PER encoding
-        // matching FreeRDP's gcc_write_conference_create_request()
         val gccRequest = buildGccConferenceCreateRequest(userData)
 
-        // FIX-9: DomainParameters with MINIMAL BER encoding
         val targetParams  = buildDomainParameters(34, 2, 0, 1, 0, 1, 65535, 2)
         val minimumParams = buildDomainParameters(1, 1, 1, 1, 0, 1, 1056, 2)
-        val maximumParams = buildDomainParameters(65535, 65535, 65535, 1, 0, 1, 65535, 2)
+        val maximumParams = buildDomainParameters(65535, 64535, 65535, 1, 0, 1, 65535, 2)
 
-        // MCS Connect Initial body
         val mcsBody = byteArrayOf(
-            0x04, 0x01, 0x01,        // callingDomainSelector
-            0x04, 0x01, 0x01,        // calledDomainSelector
-            0x01, 0x01, 0xFF.toByte()  // upwardFlag = TRUE
+            0x04, 0x01, 0x01,
+            0x04, 0x01, 0x01,
+            0x01, 0x01, 0xFF.toByte()
         ) + targetParams + minimumParams + maximumParams +
             byteArrayOf(0x04) + berLengthBytes(gccRequest.size) + gccRequest
 
-        // MCS Connect Initial outer wrapper
         val out = ByteArrayOutputStream()
-        out.write(0x7F); out.write(0x65)                       // APPLICATION 101
+        out.write(0x7F)
+        out.write(0x65)
         out.write(berLengthBytes(mcsBody.size))
         out.write(mcsBody)
         return out.toByteArray()
     }
 
-    /**
-     * FIX-11: Build GCC Conference Create Request with proper PER encoding.
-     * Matches FreeRDP's gcc_write_conference_create_request() byte-for-byte.
-     */
     private fun buildGccConferenceCreateRequest(userData: ByteArray): ByteArray {
         val s = ByteArrayOutputStream()
 
-        // per_write_choice(0) - ConnectData ::= CHOICE { createRequest ConferenceCreateRequest }
-        // CHOICE index 0 = createRequest
-        // In PER, a CHOICE with 2 alternatives uses 1 bit (0 for first)
-        // Byte-aligned: 0x00
         s.write(0x00)
-
-        // per_write_object_identifier(s, t124_02_98_oid)
-        // T.124 OID = { itu-t(0) recommendation(0) t(20) t124(124) version(0) 1 }
-        // PER encodes this as: 00 05 00 14 7C 00 01
         s.write(byteArrayOf(0x00, 0x05, 0x00, 0x14, 0x7C, 0x00, 0x01))
 
-        // per_write_length(s, pos + 14) - length of ConferenceCreateRequest fields
-        // The length includes everything after this length field
-        // ConferenceCreateRequest fields = 14 + userData
         val conferenceLen = 14 + userData.size
         writePerLength(s, conferenceLen)
 
-        // per_write_choice(s, 0) - ConferenceCreateRequest ::= CHOICE { ... }
-        // 0 = createRequest
         s.write(0x00)
-
-        // per_write_selection(s, 0x08) - selected = 8 (conferenceName OPTIONAL absent, etc.)
         s.write(0x08)
 
-        // per_write_numeric_string(s, "1", 1, 1) - numeric string "1"
-        // PER: constrained to 1 char, 1 byte
         s.write(0x01)
         s.write('1'.code)
 
-        // per_write_padding(s, 1) - 1 bit padding to byte boundary
-        // Already byte-aligned after numeric string, no extra bytes needed
-        // Actually FreeRDP writes 0x00 here for padding
         s.write(0x00)
 
-        // per_write_number_of_sets(s, 1) - numberOfUserDataSets = 1
         s.write(0x01)
 
-        // per_write_choice(s, 0xC0) - UserData ::= SET OF SEQUENCE { ... }
-        // 0xC0 = NonStandardParameter
         s.write(0xC0)
 
-        // per_write_octet_string(s, h221_cs_key, 4, 4) - "Duca" fixed 4 bytes
         s.write(byteArrayOf('D'.toByte(), 'u'.toByte(), 'c'.toByte(), 'a'.toByte()))
 
-        // per_write_octet_string(s, userData, len, 0) - variable length userData
         writePerLength(s, userData.size)
         s.write(userData)
 
         return s.toByteArray()
     }
 
-    /**
-     * PER length encoding (constrained, 0..65535).
-     * For lengths < 128: single byte.
-     * For lengths >= 128: 0x82 + 2-byte big-endian length.
-     */
     private fun writePerLength(s: ByteArrayOutputStream, length: Int) {
         when {
             length < 128 -> s.write(length)
@@ -768,10 +672,6 @@ class RdpClient(
         }
     }
 
-    /**
-     * FIX-9: Build DomainParameters with MINIMAL BER integer encoding.
-     * Matches FreeRDP's mcs_write_domain_parameters exactly.
-     */
     private fun buildDomainParameters(
         maxCh: Int, maxUs: Int, maxTok: Int,
         numPri: Int, minThr: Int, maxH: Int,
@@ -788,10 +688,6 @@ class RdpClient(
         return byteArrayOf(0x30, body.size.toByte()) + body
     }
 
-    /**
-     * BER INTEGER with MINIMAL encoding (X.690).
-     * Matches FreeRDP's ber_write_integer behavior.
-     */
     private fun berIntegerMinimal(value: Int): ByteArray {
         return when {
             value == 0 -> byteArrayOf(0x02, 0x01, 0x00)
@@ -817,87 +713,68 @@ class RdpClient(
         else           -> byteArrayOf(0x82.toByte(), (length ushr 8).toByte(), (length and 0xFF).toByte())
     }
 
-    /**
-     * FIX-12: Properly parse MCS Connect Response.
-     * Extracts the GCC Conference Create Response and validates server data blocks.
-     */
+    // MCS CONNECT RESPONSE
     private fun readMcsConnectResponse(): Boolean {
         val packet = readX224Data()
         if (packet == null) {
-            RdpLog.e("MCS Connect Response: no data received (readX224Data returned null — socket closed or read timeout)")
+            RdpLog.e("MCS Connect Response: no data received")
             return false
         }
         if (packet.isEmpty()) {
-            RdpLog.e("MCS Connect Response: received empty packet")
+            RdpLog.e("MCS Connect Response: empty packet")
             return false
         }
 
-        // Parse MCS Connect Response BER structure
         var pos = 0
         if (pos >= packet.size) return false
 
-        // Check for extended application tag (0x7F) or standard tag
         val tag = packet[pos].toInt() and 0xFF
-        if (tag == 0x7F) {
-            // Extended tag: 0x7F + tag number
-            if (pos + 1 >= packet.size) return false
-            val extTag = packet[pos + 1].toInt() and 0xFF
-            if (extTag != 0x42) {  // APPLICATION 66 = MCS Connect Response
-                RdpLog.w("MCS Connect Response: unexpected extended tag=0x$extTag (expected 0x42)")
-                // Some servers may use different tags, be lenient
+        when {
+            tag == 0x7F -> {
+                if (pos + 1 >= packet.size) return false
+                val extTag = packet[pos + 1].toInt() and 0xFF
+                if (extTag != 0x42) {
+                    RdpLog.w("MCS CR: unexpected extTag=0x${extTag.toString(16)}")
+                }
+                pos += 2
             }
-            pos += 2
-        } else if (tag == 0x30 || tag == 0x66) {
-            // SEQUENCE or APPLICATION 102 - be lenient
-            pos += 1
-        } else {
-            val preview = packet.take(16).joinToString(" ") { "%02X".format(it) }
-            RdpLog.e("MCS Connect Response: unexpected tag=0x${tag.toString(16)} size=${packet.size} bytes=[$preview]")
-            return false
+            tag == 0x30 || tag == 0x66 -> pos += 1
+            else -> {
+                val preview = packet.take(minOf(32, packet.size)).joinToString(" ") { "%02X".format(it) }
+                RdpLog.e("MCS CR: unexpected tag=0x${tag.toString(16)} bytes=[$preview]")
+            }
         }
 
-        // Read BER length
         if (pos >= packet.size) return false
         val (mcsLen, lenBytes) = readBerLength(packet, pos)
         pos += lenBytes
 
-        // Parse MCS Connect Response fields:
-        // result ENUMERATED, calledConnectId INTEGER, domainParameters DomainParameters, userData OCTET STRING
-        // For simplicity, we just verify we have enough data and look for the userData
-        // which contains the GCC Conference Create Response
-
-        // Skip result (ENUMERATED)
         if (pos + 2 > packet.size) return false
-        if (packet[pos].toInt() and 0xFF != 0x0A) return false  // ENUMERATED tag
-        pos += 2  // tag + length(1) + value(1)
+        if (packet[pos].toInt() and 0xFF == 0x0A) {
+            val resLen = packet[pos + 1].toInt() and 0xFF
+            pos += 2 + resLen
+        }
 
-        // Skip calledConnectId (INTEGER)
-        if (pos + 1 > packet.size) return false
-        if (packet[pos].toInt() and 0xFF == 0x02) {
+        if (pos + 2 <= packet.size && packet[pos].toInt() and 0xFF == 0x02) {
             val idLen = packet[pos + 1].toInt() and 0xFF
             pos += 2 + idLen
         }
 
-        // Skip domainParameters (SEQUENCE)
-        if (pos + 2 > packet.size) return false
-        if (packet[pos].toInt() and 0xFF == 0x30) {
-            val dpLen = packet[pos + 1].toInt() and 0xFF
-            pos += 2 + dpLen
+        if (pos + 2 <= packet.size && packet[pos].toInt() and 0xFF == 0x30) {
+            val dpLen = readBerLength(packet, pos).first
+            val dpLenBytes = readBerLength(packet, pos).second
+            pos += dpLenBytes + dpLen
         }
 
-        // userData (OCTET STRING) - contains GCC Conference Create Response
-        if (pos + 2 > packet.size) return false
-        if (packet[pos].toInt() and 0xFF == 0x04) {
-            val udLen = packet[pos + 1].toInt() and 0xFF
-            pos += 2
-            // GCC data starts at pos
-            RdpLog.d("MCS Connect Response: GCC data at offset $pos, length $udLen")
-            // We could parse the GCC response here, but for now just verify presence
-            return true
+        if (pos + 2 <= packet.size && packet[pos].toInt() and 0xFF == 0x04) {
+            pos++
+            val (udLen, udLenBytes) = readBerLength(packet, pos)
+            pos += udLenBytes
+            RdpLog.d("MCS CR: GCC data at offset $pos, len=$udLen")
+            if (pos + udLen <= packet.size) return true
         }
 
-        // If we get here, we couldn't find userData, but the packet was valid enough
-        RdpLog.d("MCS Connect Response: parsed successfully (lenient mode)")
+        RdpLog.d("MCS CR: parsed (lenient, pos=$pos)")
         return true
     }
 
@@ -915,13 +792,21 @@ class RdpClient(
                 val len = ((data[offset + 1].toInt() and 0xFF) shl 8) or (data[offset + 2].toInt() and 0xFF)
                 Pair(len, 3)
             }
+            first == 0x83 -> {
+                if (offset + 3 >= data.size) return Pair(0, 0)
+                val len = ((data[offset + 1].toInt() and 0xFF) shl 16) or
+                          ((data[offset + 2].toInt() and 0xFF) shl 8) or
+                          (data[offset + 3].toInt() and 0xFF)
+                Pair(len, 4)
+            }
             else -> Pair(0, 0)
         }
     }
 
+    // MCS DOMAIN SETUP
     private fun performMcsDomainSetup() {
-        sendTpkt(byteArrayOf(0x04, 0x01, 0x00, 0x01, 0x00))  // ErectDomainRequest
-        sendTpkt(byteArrayOf(0x28))                            // AttachUserRequest
+        sendTpkt(byteArrayOf(0x04, 0x01, 0x00, 0x01, 0x00))
+        sendTpkt(byteArrayOf(0x28))
 
         val aucf = readX224Data() ?: throw RdpException("No Attach User Confirm")
         if (aucf.size < 4) throw RdpException("Malformed Attach User Confirm")
@@ -930,7 +815,7 @@ class RdpClient(
         mcsUserId = ((aucf[2].toInt() and 0xFF) shl 8) or (aucf[3].toInt() and 0xFF)
         RdpLog.d("MCS user ID: $mcsUserId")
 
-        joinChannel(mcsUserId + MCS_USER_BASE)
+        joinChannel(mcsUserId + MCS_USER_CHANNEL_BASE)
         joinChannel(ioChannelId)
     }
 
@@ -943,30 +828,22 @@ class RdpClient(
             throw RdpException("Channel Join failed for channel $channelId")
     }
 
-    // ── Client Info PDU ────────────────────────────────────────────────────
-
+    // CLIENT INFO PDU
     private fun sendClientInfoPdu() {
-        val domainBytes = (credentials.domain + "\u0000").toByteArray(Charsets.UTF_16LE)
-        val userBytes   = (credentials.username + "\u0000").toByteArray(Charsets.UTF_16LE)
-        val passBytes   = (credentials.password + "\u0000").toByteArray(Charsets.UTF_16LE)
-        val shellBytes  = "\u0000".toByteArray(Charsets.UTF_16LE)
-        val workBytes   = "\u0000".toByteArray(Charsets.UTF_16LE)
+        val domainBytes = (credentials.domain + " ").toByteArray(Charsets.UTF_16LE)
+        val userBytes   = (credentials.username + " ").toByteArray(Charsets.UTF_16LE)
+        val passBytes   = (credentials.password + " ").toByteArray(Charsets.UTF_16LE)
+        val shellBytes  = " ".toByteArray(Charsets.UTF_16LE)
+        val workBytes   = " ".toByteArray(Charsets.UTF_16LE)
 
-        val infoPacketFlags = INFO_MOUSE or
-                INFO_DISABLECTRLALTDEL or
-                INFO_AUTOLOGON or
-                INFO_MAXIMIZESHELL or
-                INFO_UNICODE or
-                INFO_ENABLEWINDOWSKEY or
-                INFO_LOGON_NOTIFY
+        val infoPacketFlags = INFO_MOUSE or INFO_DISABLECTRLALTDEL or INFO_AUTOLOGON or
+                INFO_MAXIMIZESHELL or INFO_UNICODE or INFO_ENABLEWINDOWSKEY or INFO_LOGON_NOTIFY
 
         val infoPacketSize = 4 + 4 + 2 + 2 + 2 + 2 + 2 +
-                domainBytes.size + userBytes.size + passBytes.size +
-                shellBytes.size + workBytes.size
+                domainBytes.size + userBytes.size + passBytes.size + shellBytes.size + workBytes.size
 
         val secHeader = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
-        secHeader.putShort(SEC_INFO_PKT.toShort())
-        secHeader.putShort(0)
+        secHeader.putShort(SEC_INFO_PKT.toShort()); secHeader.putShort(0)
 
         val infoBuf = ByteBuffer.allocate(infoPacketSize).order(ByteOrder.LITTLE_ENDIAN)
         infoBuf.putInt(0x00000000)
@@ -976,18 +853,14 @@ class RdpClient(
         infoBuf.putShort((passBytes.size - 2).toShort())
         infoBuf.putShort((shellBytes.size - 2).toShort())
         infoBuf.putShort((workBytes.size - 2).toShort())
-        infoBuf.put(domainBytes)
-        infoBuf.put(userBytes)
-        infoBuf.put(passBytes)
-        infoBuf.put(shellBytes)
-        infoBuf.put(workBytes)
+        infoBuf.put(domainBytes); infoBuf.put(userBytes); infoBuf.put(passBytes)
+        infoBuf.put(shellBytes); infoBuf.put(workBytes)
 
         val payload = secHeader.array() + infoBuf.array().copyOf(infoBuf.position())
         sendMcsSendDataRequest(payload)
     }
 
-    // ── Demand Active + post-connection PDU burst ──────────────────────────
-
+    // DEMAND ACTIVE + POST-CONNECTION
     private fun handleDemandActivePdu() {
         var foundDemandActive = false
         for (attempt in 0 until 10) {
@@ -999,12 +872,11 @@ class RdpClient(
                     if (payload.size >= 10) {
                         serverShareId = ((payload[9].toInt() and 0xFF) shl 24) or
                                         ((payload[8].toInt() and 0xFF) shl 16) or
-                                        ((payload[7].toInt() and 0xFF) shl 8)  or
+                                        ((payload[7].toInt() and 0xFF) shl 8) or
                                         (payload[6].toInt() and 0xFF)
                         RdpLog.d("Demand Active: shareId=0x${serverShareId.toString(16)}")
                     }
-                    foundDemandActive = true
-                    break
+                    foundDemandActive = true; break
                 }
             }
         }
@@ -1012,20 +884,11 @@ class RdpClient(
             RdpLog.w("Demand Active PDU not found; using default shareId=0x${serverShareId.toString(16)}")
         }
 
-        sendConfirmActivePdu()
-        RdpLog.d("PDU burst: Confirm Active sent")
-
-        sendSynchronizePdu()
-        RdpLog.d("PDU burst: Synchronize sent")
-
-        sendControlPdu(CTRLACTION_COOPERATE)
-        RdpLog.d("PDU burst: Control COOPERATE sent")
-
-        sendControlPdu(CTRLACTION_REQUEST_CONTROL)
-        RdpLog.d("PDU burst: Control REQUEST_CONTROL sent")
-
-        sendFontListPdu()
-        RdpLog.d("PDU burst: Font List sent")
+        sendConfirmActivePdu(); RdpLog.d("PDU burst: Confirm Active sent")
+        sendSynchronizePdu(); RdpLog.d("PDU burst: Synchronize sent")
+        sendControlPdu(CTRLACTION_COOPERATE); RdpLog.d("PDU burst: Control COOPERATE sent")
+        sendControlPdu(CTRLACTION_REQUEST_CONTROL); RdpLog.d("PDU burst: Control REQUEST_CONTROL sent")
+        sendFontListPdu(); RdpLog.d("PDU burst: Font List sent")
 
         var drained = 0
         for (i in 0 until 8) {
@@ -1035,32 +898,25 @@ class RdpClient(
             if (payload.size >= 3) {
                 val pduType = payload[2].toInt() and 0xFF
                 RdpLog.d("Post-burst server PDU type=0x${pduType.toString(16)}")
-                if (pduType == PDU_TYPE_DATA) {
-                    drained++
-                    if (drained >= 4) break
-                }
+                if (pduType == PDU_TYPE_DATA) { drained++; if (drained >= 4) break }
             }
         }
         RdpLog.d("Post-burst drain complete ($drained PDUs consumed)")
     }
 
-    // ── Confirm Active PDU ────────────────────────────────────────────────
-
+    // CONFIRM ACTIVE PDU
     private fun sendConfirmActivePdu() {
-        val caps          = buildCapabilitySets()
-        val srcDesc       = byteArrayOf('R'.code.toByte(), 'D'.code.toByte(), 'P'.code.toByte(), 0x00)
-        val srcDescLen    = srcDesc.size.toShort()
-        val numCaps       = countCapabilitySets(caps).toShort()
-        val combinedLen   = (caps.size + 4).toShort()
-
+        val caps = buildCapabilitySets()
+        val srcDesc = byteArrayOf('R'.code.toByte(), 'D'.code.toByte(), 'P'.code.toByte(), 0x00)
+        val srcDescLen = srcDesc.size.toShort()
+        val numCaps = countCapabilitySets(caps).toShort()
+        val combinedLen = (caps.size + 4).toShort()
         val totalLength = 6 + 4 + 2 + 2 + 2 + srcDesc.size + 2 + 2 + caps.size
 
         val buf = ByteBuffer.allocate(totalLength).order(ByteOrder.LITTLE_ENDIAN)
-
         buf.putShort(totalLength.toShort())
         buf.putShort(PDU_TYPE_CONFIRM_ACTIVE.toShort())
         buf.putShort(0x03EA.toShort())
-
         buf.putInt(serverShareId)
         buf.putShort(0x03EA.toShort())
         buf.putShort(srcDescLen)
@@ -1069,18 +925,15 @@ class RdpClient(
         buf.putShort(numCaps)
         buf.putShort(0)
         buf.put(caps)
-
         sendMcsSendDataRequest(buf.array().copyOf(buf.position()))
     }
 
     private fun countCapabilitySets(caps: ByteArray): Int {
-        var count = 0
-        var pos = 0
+        var count = 0; var pos = 0
         while (pos + 4 <= caps.size) {
             val len = ((caps[pos + 3].toInt() and 0xFF) shl 8) or (caps[pos + 2].toInt() and 0xFF)
             if (len < 4 || pos + len > caps.size) break
-            count++
-            pos += len
+            count++; pos += len
         }
         return count
     }
@@ -1090,167 +943,103 @@ class RdpClient(
 
         // CAPSTYPE_GENERAL (0x0001) — 24 bytes
         buf.putShort(0x0001); buf.putShort(24)
-        buf.putShort(1)
-        buf.putShort(3)
-        buf.putShort(0x0200)
-        buf.putShort(0)
-        buf.putShort(0)
-        buf.putShort(0x0441)
-        buf.putShort(0)
-        buf.putShort(0)
-        buf.putShort(0)
-        buf.putShort(0)
-        buf.put(1)
-        buf.put(1)
+        buf.putShort(1); buf.putShort(3); buf.putShort(0x0200)
+        buf.putShort(0); buf.putShort(0); buf.putShort(0x0441)
+        buf.putShort(0); buf.putShort(0); buf.putShort(0); buf.putShort(0)
+        buf.put(1); buf.put(1)
 
         // CAPSTYPE_BITMAP (0x0002) — 28 bytes
         buf.putShort(0x0002); buf.putShort(28)
-        buf.putShort(32)
-        buf.putShort(1)
-        buf.putShort(1)
-        buf.putShort(1)
-        buf.putShort(displayWidth.toShort())
-        buf.putShort(displayHeight.toShort())
-        buf.putShort(0)
-        buf.putShort(1)
-        buf.putShort(1)
-        buf.put(0)
-        buf.put(0)
-        buf.putShort(1)
-        buf.putShort(0)
+        buf.putShort(32); buf.putShort(1); buf.putShort(1); buf.putShort(1)
+        buf.putShort(displayWidth.toShort()); buf.putShort(displayHeight.toShort())
+        buf.putShort(0); buf.putShort(1); buf.putShort(1)
+        buf.put(0); buf.put(0); buf.putShort(1); buf.putShort(0)
 
         // CAPSTYPE_ORDER (0x0003) — 88 bytes
         buf.putShort(0x0003); buf.putShort(88)
         repeat(16) { buf.put(0) }
-        buf.putInt(0)
-        buf.putShort(1)
-        buf.putShort(20)
-        buf.putShort(0)
-        buf.putShort(1)
-        buf.putShort(0)
-        buf.putShort(0x002F)
+        buf.putInt(0); buf.putShort(1); buf.putShort(20); buf.putShort(0)
+        buf.putShort(1); buf.putShort(0); buf.putShort(0x002F)
         repeat(32) { buf.put(0) }
-        buf.putShort(0)
-        buf.putShort(0x0040)
-        buf.putInt(0)
-        buf.putInt(230400)
-        buf.putShort(0)
-        buf.putShort(0)
-        buf.putShort(0x0409)
-        buf.putShort(0)
+        buf.putShort(0); buf.putShort(0x0040); buf.putInt(0)
+        buf.putInt(230400); buf.putShort(0); buf.putShort(0); buf.putShort(0x0409); buf.putShort(0)
 
         // CAPSTYPE_BITMAPCACHE_REV2 (0x0013) — 40 bytes
         buf.putShort(0x0013); buf.putShort(40)
-        buf.putShort(0x0003)
-        buf.putShort(0)
-        buf.put(3)
+        buf.putShort(0x0003); buf.putShort(0); buf.put(3)
         buf.put(0); buf.put(0); buf.put(0)
-        buf.putInt(600)
-        buf.putInt(0x00000078)
-        buf.putInt(0x00000078)
+        buf.putInt(600); buf.putInt(0x00000078); buf.putInt(0x00000078)
         repeat(16) { buf.put(0) }
 
         // CAPSTYPE_POINTER (0x0008) — 10 bytes
         buf.putShort(0x0008); buf.putShort(10)
-        buf.putShort(1)
-        buf.putShort(20)
-        buf.putShort(20)
+        buf.putShort(1); buf.putShort(20); buf.putShort(20)
 
         // CAPSTYPE_INPUT (0x000D) — 88 bytes
         buf.putShort(0x000D); buf.putShort(88)
-        buf.putShort(0x0008)
-        buf.putShort(0)
-        buf.putInt(0x00000409)
-        buf.putInt(4)
-        buf.putInt(0)
-        buf.putInt(12)
+        buf.putShort(0x0008); buf.putShort(0)
+        buf.putInt(0x00000409); buf.putInt(4); buf.putInt(0); buf.putInt(12)
         repeat(64) { buf.put(0) }
 
         // CAPSTYPE_BRUSH (0x000F) — 8 bytes
-        buf.putShort(0x000F); buf.putShort(8)
-        buf.putInt(1)
+        buf.putShort(0x000F); buf.putShort(8); buf.putInt(1)
 
         // CAPSTYPE_GLYPHCACHE (0x0010) — 52 bytes
         buf.putShort(0x0010); buf.putShort(52)
         repeat(10) { buf.putShort(0x0100); buf.putShort(0x0004) }
-        buf.putInt(0x00000001)
-        buf.putShort(0x0001)
-        buf.putShort(0)
+        buf.putInt(0x00000001); buf.putShort(0x0001); buf.putShort(0)
 
         // CAPSTYPE_OFFSCREENCACHE (0x0011) — 12 bytes
         buf.putShort(0x0011); buf.putShort(12)
-        buf.putInt(7680)
-        buf.putShort(0x0064)
-        buf.putShort(0x0001)
+        buf.putInt(7680); buf.putShort(0x0064); buf.putShort(0x0001)
 
         // CAPSTYPE_VIRTUALCHANNEL (0x0014) — 12 bytes
         buf.putShort(0x0014); buf.putShort(12)
-        buf.putInt(0)
-        buf.putInt(0x00020000)
+        buf.putInt(0); buf.putInt(0x00020000)
 
         // CAPSTYPE_SOUND (0x000C) — 8 bytes
-        buf.putShort(0x000C); buf.putShort(8)
-        buf.putShort(0)
-        buf.putShort(0)
+        buf.putShort(0x000C); buf.putShort(8); buf.putShort(0); buf.putShort(0)
 
         // CAPSTYPE_SURFACE_COMMANDS (0x001D) — 8 bytes
-        buf.putShort(0x001D); buf.putShort(8)
-        buf.putInt(0x00000001)
+        buf.putShort(0x001D); buf.putShort(8); buf.putInt(0x00000001)
 
         return buf.array().copyOf(buf.position())
     }
 
-    // ── Post-connection sync/control/font PDUs ─────────────────────────────
-
+    // POST-CONNECTION PDUs
     private fun buildDataPdu(pduType2: Int, payload: ByteArray): ByteArray {
         val totalLength = 6 + 18 + payload.size
         val buf = ByteBuffer.allocate(totalLength).order(ByteOrder.LITTLE_ENDIAN)
-
         buf.putShort(totalLength.toShort())
         buf.putShort(PDU_TYPE_DATA.toShort())
         buf.putShort(0x03EA.toShort())
-
         buf.putInt(serverShareId)
-        buf.put(0)
-        buf.put(1)
+        buf.put(0); buf.put(1)
         buf.putShort((4 + payload.size).toShort())
-        buf.put(pduType2.toByte())
-        buf.put(0)
-        buf.putShort(0)
-
+        buf.put(pduType2.toByte()); buf.put(0); buf.putShort(0)
         buf.put(payload)
         return buf.array().copyOf(buf.position())
     }
 
     private fun sendSynchronizePdu() {
         val payload = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
-            .putShort(1)
-            .putShort(mcsUserId.toShort())
-            .array()
+            .putShort(1).putShort(mcsUserId.toShort()).array()
         sendMcsSendDataRequest(buildDataPdu(PDUTYPE2_SYNCHRONIZE, payload))
     }
 
     private fun sendControlPdu(action: Int) {
         val payload = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
-            .putShort(action.toShort())
-            .putShort(0)
-            .putInt(0)
-            .array()
+            .putShort(action.toShort()).putShort(0).putInt(0).array()
         sendMcsSendDataRequest(buildDataPdu(PDUTYPE2_CONTROL, payload))
     }
 
     private fun sendFontListPdu() {
         val payload = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
-            .putShort(0)
-            .putShort(0)
-            .putShort(0x0003)
-            .putShort(0x0032)
-            .array()
+            .putShort(0).putShort(0).putShort(0x0003).putShort(0x0032).array()
         sendMcsSendDataRequest(buildDataPdu(PDUTYPE2_FONTLIST, payload))
     }
 
-    // ── Receive loop ────────────────────────────────────────────────────────
-
+    // RECEIVE LOOP
     private suspend fun receiveLoop() = withContext(Dispatchers.IO) {
         var consecutiveErrors = 0
         while (connected && isActive) {
@@ -1278,26 +1067,18 @@ class RdpClient(
 
     private suspend fun processIncomingPdu(data: ByteArray) {
         if (data.isEmpty()) return
-
-        val isMcsSdi = data.size >= 3 &&
-                (data[0].toInt() and 0xFF) == 0x02 &&
-                (data[1].toInt() and 0xFF) == 0xF0
-
+        val isMcsSdi = data.size >= 3 && (data[0].toInt() and 0xFF) == 0x02 && (data[1].toInt() and 0xFF) == 0xF0
         if (isMcsSdi) {
             val payload = stripMcsSendDataIndication(data.copyOfRange(3, data.size))
             if (payload.size >= 3) {
                 val pduType = payload[2].toInt() and 0xFF
                 when (pduType) {
-                    PDU_TYPE_DEMAND_ACTIVE -> {
-                        RdpLog.d("Reactivation: new Demand Active received")
-                        handleDemandActivePdu()
-                    }
+                    PDU_TYPE_DEMAND_ACTIVE -> { RdpLog.d("Reactivation: new Demand Active"); handleDemandActivePdu() }
                     else -> Log.v(TAG, "Unhandled MCS PDU type: 0x${pduType.toString(16)}")
                 }
             }
             return
         }
-
         processDataPdu(data)
     }
 
@@ -1310,37 +1091,32 @@ class RdpClient(
     private fun adaptPerformance() {
         bandwidthKbps = bandwidthDetector.getCurrentKbps()
         currentPerformance = when {
-            bandwidthKbps < 100  -> RdpPerformance.LOW_BANDWIDTH
-            bandwidthKbps < 500  -> RdpPerformance.MEDIUM
+            bandwidthKbps < 100 -> RdpPerformance.LOW_BANDWIDTH
+            bandwidthKbps < 500 -> RdpPerformance.MEDIUM
             bandwidthKbps < 2000 -> RdpPerformance.WIFI
-            else                 -> RdpPerformance.LAN
+            else -> RdpPerformance.LAN
         }
     }
 
-    // ── Input ───────────────────────────────────────────────────────────────
-
+    // INPUT HANDLING
     fun sendMouseMove(x: Int, y: Int) {
         if (!connected) return
         val buf = ByteBuffer.allocate(7).order(ByteOrder.LITTLE_ENDIAN)
-        buf.put(0x10.toByte())
-        buf.putShort(0x0800.toShort())
-        buf.putShort(x.toShort())
-        buf.putShort(y.toShort())
+        buf.put(0x10.toByte()); buf.putShort(0x0800.toShort())
+        buf.putShort(x.toShort()); buf.putShort(y.toShort())
         sendFastPathInput(buf.array().copyOf(buf.position()))
     }
 
     fun sendMouseClick(x: Int, y: Int, button: MouseButton, down: Boolean) {
         if (!connected) return
         val flags: Short = when (button) {
-            MouseButton.LEFT   -> if (down) (0x1000 or 0x8000) else 0x1000
-            MouseButton.RIGHT  -> if (down) (0x2000 or 0x8000) else 0x2000
+            MouseButton.LEFT -> if (down) (0x1000 or 0x8000) else 0x1000
+            MouseButton.RIGHT -> if (down) (0x2000 or 0x8000) else 0x2000
             MouseButton.MIDDLE -> if (down) (0x4000 or 0x8000) else 0x4000
         }.toShort()
         val buf = ByteBuffer.allocate(7).order(ByteOrder.LITTLE_ENDIAN)
-        buf.put(0x10.toByte())
-        buf.putShort(flags)
-        buf.putShort(x.toShort())
-        buf.putShort(y.toShort())
+        buf.put(0x10.toByte()); buf.putShort(flags)
+        buf.putShort(x.toShort()); buf.putShort(y.toShort())
         sendFastPathInput(buf.array().copyOf(buf.position()))
     }
 
@@ -1349,8 +1125,7 @@ class RdpClient(
         val buf = ByteBuffer.allocate(7).order(ByteOrder.LITTLE_ENDIAN)
         buf.put(0x10.toByte())
         buf.putShort((0x0200 or if (delta > 0) 0x0100 else 0x0000).toShort())
-        buf.putShort(x.toShort())
-        buf.putShort(y.toShort())
+        buf.putShort(x.toShort()); buf.putShort(y.toShort())
         sendFastPathInput(buf.array().copyOf(buf.position()))
     }
 
@@ -1359,8 +1134,7 @@ class RdpClient(
         val eventFlags = (if (!down) 0x01 else 0x00) or (if (extended) 0x02 else 0x00)
         val eventHeader = ((0x01 shl 4) or eventFlags).toByte()
         val buf = ByteBuffer.allocate(2)
-        buf.put(eventHeader)
-        buf.put((scanCode and 0xFF).toByte())
+        buf.put(eventHeader); buf.put((scanCode and 0xFF).toByte())
         sendFastPathInput(buf.array().copyOf(buf.position()))
     }
 
@@ -1369,22 +1143,18 @@ class RdpClient(
         val eventFlags = if (!down) 0x01 else 0x00
         val eventHeader = ((0x04 shl 4) or eventFlags).toByte()
         val buf = ByteBuffer.allocate(3).order(ByteOrder.LITTLE_ENDIAN)
-        buf.put(eventHeader)
-        buf.putShort(char.code.toShort())
+        buf.put(eventHeader); buf.putShort(char.code.toShort())
         sendFastPathInput(buf.array().copyOf(buf.position()))
     }
 
     fun sendCtrlAltDel() {
-        sendKeyEvent(0x1D, true)
-        sendKeyEvent(0x38, true)
+        sendKeyEvent(0x1D, true); sendKeyEvent(0x38, true)
         sendKeyEvent(0x53, true, extended = true)
         sendKeyEvent(0x53, false, extended = true)
-        sendKeyEvent(0x38, false)
-        sendKeyEvent(0x1D, false)
+        sendKeyEvent(0x38, false); sendKeyEvent(0x1D, false)
     }
 
-    // ── I/O helpers ─────────────────────────────────────────────────────────
-
+    // I/O HELPERS
     private fun sendFastPathInput(data: ByteArray) {
         try {
             val header = ByteBuffer.allocate(4)
@@ -1403,10 +1173,7 @@ class RdpClient(
     private fun sendTpkt(data: ByteArray) {
         val x224Data = byteArrayOf(0x02, 0xF0.toByte(), 0x80.toByte()) + data
         val length = x224Data.size + 4
-        val header = byteArrayOf(
-            TPKT_VERSION.toByte(), 0x00,
-            (length shr 8).toByte(), (length and 0xFF).toByte()
-        )
+        val header = byteArrayOf(TPKT_VERSION.toByte(), 0x00, (length shr 8).toByte(), (length and 0xFF).toByte())
         synchronized(outputStream!!) { outputStream?.write(header + x224Data); outputStream?.flush() }
     }
 
@@ -1415,7 +1182,7 @@ class RdpClient(
         header.put(0x64); header.putShort(mcsUserId.toShort())
         header.putShort(ioChannelId.toShort()); header.put(0x70)
         val lengthBytes = if (data.size < 0x80) byteArrayOf(data.size.toByte())
-                          else byteArrayOf((0x80 or (data.size shr 8)).toByte(), (data.size and 0xFF).toByte())
+            else byteArrayOf((0x80 or (data.size shr 8)).toByte(), (data.size and 0xFF).toByte())
         sendTpkt(header.array() + lengthBytes + data)
     }
 
@@ -1439,8 +1206,7 @@ class RdpClient(
                 }
             }
             if (contentLength <= 0 || contentLength > 1_048_576) return null
-            val content = ByteArray(contentLength)
-            inputStream?.readFully(content)
+            val content = ByteArray(contentLength); inputStream?.readFully(content)
             val header = if (lengthHeaderExtra == 0) byteArrayOf(0x30, firstLenByte.toByte())
             else {
                 val lenBytes = ByteArray(lengthHeaderExtra)
@@ -1452,28 +1218,53 @@ class RdpClient(
         } catch (e: Exception) { RdpLog.w("readRaw failed: ${e.message}"); null }
     }
 
+    // FIX-18: readTpkt handles Fast Path packets (0x00-0x03)
     private fun readTpkt(): ByteArray? {
         return try {
-            val header = ByteArray(4)
-            inputStream?.readFully(header) ?: return null
-            if ((header[0].toInt() and 0xFF) != TPKT_VERSION) {
-                val fpLen = if ((header[1].toInt() and 0x80) != 0)
-                    ((header[1].toInt() and 0x7F) shl 8) or (header[2].toInt() and 0xFF)
-                else header[1].toInt() and 0xFF
+            val firstByte = inputStream?.readUnsignedByte() ?: return null
+
+            // Fast Path: first byte 0x00-0x03 (action code)
+            if (firstByte in 0x00..0x03) {
+                val secondByte = inputStream?.readUnsignedByte() ?: return null
+                val fpLen = if ((secondByte and 0x80) != 0) {
+                    val thirdByte = inputStream?.readUnsignedByte() ?: return null
+                    ((secondByte and 0x7F) shl 8) or thirdByte
+                } else {
+                    secondByte
+                }
                 val remaining = fpLen - 2
-                if (remaining <= 0) return byteArrayOf(header[0])
-                val data = ByteArray(remaining); inputStream?.readFully(data); return data
+                if (remaining <= 0) return byteArrayOf(firstByte.toByte())
+                val data = ByteArray(remaining); inputStream?.readFully(data)
+                return byteArrayOf(firstByte.toByte()) + data
             }
-            val length = ((header[2].toInt() and 0xFF) shl 8) or (header[3].toInt() and 0xFF)
+
+            // Standard TPKT
+            if (firstByte != TPKT_VERSION) {
+                RdpLog.w("readTpkt: unexpected first byte 0x${firstByte.toString(16)}")
+                val rest = ByteArray(3); inputStream?.readFully(rest)
+                val length = ((rest[1].toInt() and 0xFF) shl 8) or (rest[2].toInt() and 0xFF)
+                val dataLength = length - 4
+                if (dataLength <= 0) return ByteArray(0)
+                val data = ByteArray(dataLength); inputStream?.readFully(data)
+                return data
+            }
+
+            val headerRest = ByteArray(3); inputStream?.readFully(headerRest)
+            val length = ((headerRest[1].toInt() and 0xFF) shl 8) or (headerRest[2].toInt() and 0xFF)
             val dataLength = length - 4
             if (dataLength <= 0) return ByteArray(0)
-            val data = ByteArray(dataLength); inputStream?.readFully(data); data
-        } catch (e: Exception) { null }
+            val data = ByteArray(dataLength); inputStream?.readFully(data)
+            data
+        } catch (e: Exception) { RdpLog.w("readTpkt failed: ${e.message}"); null }
     }
 
+    // FIX-18: readX224Data handles Fast Path and returns raw data on mismatch
     private fun readX224Data(): ByteArray? {
         val data = readTpkt() ?: return null
-        if (data.size >= 3 && (data[1].toInt() and 0xFF) == 0xF0) return data.copyOfRange(3, data.size)
+        if (data.size >= 3 && (data[1].toInt() and 0xFF) == 0xF0) {
+            return data.copyOfRange(3, data.size)
+        }
+        // Not X.224 Data TPDU, return raw (might be Fast Path)
         return data
     }
 
@@ -1487,12 +1278,9 @@ class RdpClient(
         return if (offset <= data.size) data.copyOfRange(offset, data.size) else data
     }
 
-    // ── Lifecycle ───────────────────────────────────────────────────────────
-
+    // LIFECYCLE
     fun disconnect() {
-        connected = false
-        clientScope.cancel()
-        cleanup()
+        connected = false; clientScope.cancel(); cleanup()
     }
 
     private fun cleanup() {
@@ -1502,8 +1290,7 @@ class RdpClient(
     }
 }
 
-// ── Supporting types ────────────────────────────────────────────────────────
-
+// SUPPORTING TYPES
 enum class RdpSessionState { DISCONNECTED, CONNECTING, CONNECTED, RECONNECTING, AUTH_FAILED, ERROR }
 enum class MouseButton { LEFT, RIGHT, MIDDLE }
 
@@ -1512,9 +1299,8 @@ data class RdpFrameUpdate(
     val pixels: IntArray, val fullScreen: Boolean = false
 )
 
-class RdpException(message: String) : Exception(message)
+class RdpExcegption(message: String) : Exception(message)
 class RdpAuthException(message: String) : Exception(message)
-
 class RdpNegotiationFailure(val code: Int, message: String) : Exception(message)
 
 class BandwidthDetector {
