@@ -1,9 +1,9 @@
 package com.gotohex.rdp.rdp.protocol
 
+import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.security.MessageDigest
-import java.security.SecureRandom
 import javax.crypto.Cipher
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
@@ -11,15 +11,16 @@ import javax.crypto.spec.SecretKeySpec
 /**
  * NTLMv2 authentication + MS-NLMP "session security" (signing/sealing).
  *
- * COMPREHENSIVE FIXES APPLIED (2025):
- * 1. LmChallengeResponse: Now zero-length in NTLMv2 per MS-NLMP 3.1.5.2.1
- * 2. MIC: Uses correct key (ExportedSessionKey when NEGOTIATE_KEY_EXCH set)
- * 3. MsvAvChannelBindings: Added Z(16) for Channel Binding Token (CBT)
- * 4. MsvAvTargetName: Added empty string AV_PAIR
- * 5. MsvAvFlags: Added/updated with MIC required bit (0x2)
- * 6. Key derivation: Uses proper MS-NLMP key derivation with magic constants
- * 7. RC4 per-message key: Uses MD5(sealingKey || seqNum) for Extended Session Security
- * 8. MsvAvEOL terminator: Ensures targetInfo always ends with MsvAvEOL (0x0000 0x0000)
+ * COMPREHENSIVE FIXES:
+ * 1. MIC calculation: When target info contains MsvAvFlags with bit 0x2 (MIC required),
+ *    the AUTHENTICATE message MUST include a valid MIC. Without it, modern Windows
+ *    servers reject authentication immediately.
+ *
+ * 2. Key derivation: Uses proper MS-NLMP key derivation with magic constants.
+ *
+ * 3. RC4 per-message key: Uses MD5(sealingKey || seqNum) for Extended Session Security.
+ *
+ * 4. MsvAvEOL terminator: Ensures targetInfo always ends with MsvAvEOL (0x0000 0x0000).
  */
 object NtlmHelper {
 
@@ -43,17 +44,8 @@ object NtlmHelper {
     private const val NTLMSSP_NEGOTIATE_VERSION = 0x02000000
 
     // AV_PAIR IDs
-    private const val MsvAvEOL = 0x0000
-    private const val MsvAvNbComputerName = 0x0001
-    private const val MsvAvNbDomainName = 0x0002
-    private const val MsvAvDnsComputerName = 0x0003
-    private const val MsvAvDnsDomainName = 0x0004
-    private const val MsvAvDnsTreeName = 0x0005
     private const val MsvAvFlags = 0x0006
-    private const val MsvAvTimestamp = 0x0007
-    private const val MsvAvSingleHost = 0x0008
-    private const val MsvAvTargetName = 0x0009
-    private const val MsvAvChannelBindings = 0x000A
+    private const val MsvAvEOL = 0x0000
 
     /** Parsed fields from an NTLM CHALLENGE_MESSAGE (type 2). */
     data class NtlmChallenge(
@@ -67,8 +59,7 @@ object NtlmHelper {
         serverSealingKey: ByteArray,
         val clientSigningKey: ByteArray,
         val serverSigningKey: ByteArray,
-        val exportedSessionKey: ByteArray,
-        val keyExchangeKey: ByteArray  // Added for MIC verification
+        val exportedSessionKey: ByteArray
     ) {
         val clientSealingKeyOriginal = clientSealingKey.copyOf()
         val serverSealingKeyOriginal = serverSealingKey.copyOf()
@@ -149,27 +140,23 @@ object NtlmHelper {
         val ntlmV2Hash = ntlmV2Hash(ntHash, username, domain)
         val timestamp = windowsTimestamp()
 
-        // FIX #3, #4, #5: Build enhanced targetInfo with required AV_PAIRs
-        val enhancedTargetInfo = buildEnhancedTargetInfo(challenge.targetInfo)
-
         // Check if MIC is required (MsvAvFlags bit 0x2)
-        val micRequired = isMicRequired(enhancedTargetInfo)
+        val micRequired = isMicRequired(challenge.targetInfo)
 
-        val blob = buildNtlmV2Blob(clientChallenge, timestamp, enhancedTargetInfo)
+        val blob = buildNtlmV2Blob(clientChallenge, timestamp, challenge.targetInfo)
         val ntProofStr = computeNtProofStr(ntlmV2Hash, challenge.serverChallenge, blob)
         val ntResponse = ntProofStr + blob
 
-        // FIX #1: LmChallengeResponse MUST be zero-length in NTLMv2
-        // per MS-NLMP Section 3.1.5.2.1
-        val lmResponse = ByteArray(0)
+        val lmHmac = Mac.getInstance("HmacMD5").apply { init(SecretKeySpec(ntlmV2Hash, "HmacMD5")) }
+        val lmProof = lmHmac.doFinal(challenge.serverChallenge + clientChallenge)
+        val lmResponse = lmProof + clientChallenge
 
         val sessionBaseKeyMac = Mac.getInstance("HmacMD5").apply { init(SecretKeySpec(ntlmV2Hash, "HmacMD5")) }
         val sessionBaseKey = sessionBaseKeyMac.doFinal(ntProofStr)
 
-        // KeyExchangeKey = SessionBaseKey in NTLMv2
         val keyExchangeKey = sessionBaseKey
 
-        val exportedSessionKey = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        val exportedSessionKey = ByteArray(16).also { java.security.SecureRandom().nextBytes(it) }
         val encryptedRandomSessionKey = rc4(keyExchangeKey, exportedSessionKey)
 
         val domainBytes = domain.toByteArray(Charsets.UTF_16LE)
@@ -188,12 +175,11 @@ object NtlmHelper {
                 NTLMSSP_NEGOTIATE_TARGET_INFO or
                 NTLMSSP_NEGOTIATE_ALWAYS_SIGN)
 
-        // Calculate offsets
         val headerSize = 88
         val domainOff = headerSize
         val userOff = domainOff + domainBytes.size
         val workstationOff = userOff + userBytes.size
-        val lmOff = workstationOff + lmResponse.size  // Will be same as workstationOff if lmResponse is empty
+        val lmOff = workstationOff + workstationBytes.size
         val ntOff = lmOff + lmResponse.size
         val sessionKeyOff = ntOff + ntResponse.size
         val totalSize = sessionKeyOff + encryptedRandomSessionKey.size
@@ -202,7 +188,6 @@ object NtlmHelper {
         buf.put(NTLM_SIGNATURE.toByteArray(Charsets.US_ASCII))
         buf.putInt(AUTHENTICATE_MESSAGE)
 
-        // LmChallengeResponse fields (zero length in NTLMv2)
         buf.putShort(lmResponse.size.toShort())
         buf.putShort(lmResponse.size.toShort())
         buf.putInt(lmOff)
@@ -237,22 +222,15 @@ object NtlmHelper {
         buf.put(domainBytes)
         buf.put(userBytes)
         buf.put(workstationBytes)
-        // LmResponse is empty, so nothing to write
+        buf.put(lmResponse)
         buf.put(ntResponse)
         buf.put(encryptedRandomSessionKey)
 
         val message = buf.array().copyOf(buf.position())
 
-        // FIX #2: Calculate and patch MIC if required
-        // Use ExportedSessionKey when NEGOTIATE_KEY_EXCH is set
-        val micKey = if ((negotiateFlags and NTLMSSP_NEGOTIATE_KEY_EXCH) != 0) {
-            exportedSessionKey
-        } else {
-            keyExchangeKey
-        }
-
+        // Calculate and patch MIC if required
         if (micRequired && negotiateMessage != null && challengeMessage != null) {
-            val mic = calculateMic(micKey, negotiateMessage, challengeMessage, message, micPosition)
+            val mic = calculateMic(exportedSessionKey, negotiateMessage, challengeMessage, message, micPosition)
             mic.copyInto(message, micPosition)
         }
 
@@ -266,73 +244,10 @@ object NtlmHelper {
             serverSealingKey = serverSealingKey,
             clientSigningKey = clientSigningKey,
             serverSigningKey = serverSigningKey,
-            exportedSessionKey = exportedSessionKey,
-            keyExchangeKey = keyExchangeKey  // Added for verification
+            exportedSessionKey = exportedSessionKey
         )
 
         return AuthenticateResult(message, state)
-    }
-
-    /**
-     * FIX #3, #4, #5: Build enhanced targetInfo with required AV_PAIRs:
-     * - MsvAvChannelBindings (Z(16))
-     * - MsvAvTargetName (empty string)
-     * - MsvAvFlags with MIC required bit (0x2)
-     */
-    private fun buildEnhancedTargetInfo(originalTargetInfo: ByteArray): ByteArray {
-        val avPairs = mutableListOf<Pair<Int, ByteArray>>()
-
-        // Parse existing AV pairs
-        var offset = 0
-        while (offset + 4 <= originalTargetInfo.size) {
-            val avId = (originalTargetInfo[offset].toInt() and 0xFF) or
-                    ((originalTargetInfo[offset + 1].toInt() and 0xFF) shl 8)
-            val avLen = (originalTargetInfo[offset + 2].toInt() and 0xFF) or
-                    ((originalTargetInfo[offset + 3].toInt() and 0xFF) shl 8)
-
-            if (avId == MsvAvEOL) break
-
-            if (offset + 4 + avLen <= originalTargetInfo.size) {
-                val value = originalTargetInfo.copyOfRange(offset + 4, offset + 4 + avLen)
-                avPairs.add(avId to value)
-            }
-            offset += 4 + avLen
-        }
-
-        // Add MsvAvChannelBindings (Z(16)) - FIX #3
-        avPairs.add(MsvAvChannelBindings to ByteArray(16) { 0 })
-
-        // Add MsvAvTargetName (empty string) - FIX #4
-        avPairs.add(MsvAvTargetName to ByteArray(0))
-
-        // Add/Update MsvAvFlags with MIC required bit - FIX #5
-        val existingFlagsIndex = avPairs.indexOfFirst { it.first == MsvAvFlags }
-        val flagsValue = if (existingFlagsIndex >= 0) {
-            val existingFlags = (avPairs[existingFlagsIndex].second[0].toInt() and 0xFF) or
-                    ((avPairs[existingFlagsIndex].second[1].toInt() and 0xFF) shl 8) or
-                    ((avPairs[existingFlagsIndex].second[2].toInt() and 0xFF) shl 16) or
-                    ((avPairs[existingFlagsIndex].second[3].toInt() and 0xFF) shl 24)
-            val newFlags = existingFlags or 0x00000002
-            avPairs.removeAt(existingFlagsIndex)
-            ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(newFlags).array()
-        } else {
-            ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(0x00000002).array()
-        }
-        avPairs.add(MsvAvFlags to flagsValue)
-
-        // Build enhanced targetInfo
-        val result = ByteArrayOutputStream()
-        for ((avId, value) in avPairs) {
-            result.write(avId and 0xFF)
-            result.write((avId shr 8) and 0xFF)
-            result.write(value.size and 0xFF)
-            result.write((value.size shr 8) and 0xFF)
-            result.write(value)
-        }
-        // Add MsvAvEOL terminator
-        result.write(byteArrayOf(0x00, 0x00, 0x00, 0x00))
-
-        return result.toByteArray()
     }
 
     /**
@@ -361,17 +276,16 @@ object NtlmHelper {
     }
 
     /**
-     * FIX #2: Calculates MIC = HMAC_MD5(key, negotiateMsg + challengeMsg + authenticateMsgWithZeroedMic)
-     * Uses ExportedSessionKey when NEGOTIATE_KEY_EXCH is set, otherwise KeyExchangeKey
+     * Calculates MIC = HMAC_MD5(exportedSessionKey, negotiateMsg + challengeMsg + authenticateMsgWithZeroedMic)
      */
     private fun calculateMic(
-        key: ByteArray,
+        exportedSessionKey: ByteArray,
         negotiateMessage: ByteArray,
         challengeMessage: ByteArray,
         authenticateMessage: ByteArray,
         micPosition: Int
     ): ByteArray {
-        val mac = Mac.getInstance("HmacMD5").apply { init(SecretKeySpec(key, "HmacMD5")) }
+        val mac = Mac.getInstance("HmacMD5").apply { init(SecretKeySpec(exportedSessionKey, "HmacMD5")) }
         mac.update(negotiateMessage)
         mac.update(challengeMessage)
         // For MIC calculation, use authenticate message with zeroed MIC field
@@ -479,7 +393,7 @@ object NtlmHelper {
 
     private fun generateClientChallenge(): ByteArray {
         val bytes = ByteArray(8)
-        SecureRandom().nextBytes(bytes)
+        java.security.SecureRandom().nextBytes(bytes)
         return bytes
     }
 
