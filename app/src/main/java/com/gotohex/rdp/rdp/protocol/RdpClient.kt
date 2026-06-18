@@ -384,6 +384,7 @@ class RdpClient(
         outputStream?.write(buf.array())
         outputStream?.flush()
         RdpLog.d("X.224 CR sent, length=$tpktLength, proto=0x${requestedProtocols.toString(16)}")
+        RdpLog.hex("X.224 CR raw bytes", buf.array())
     }
 
     private fun readX224ConnectionConfirm(): Boolean {
@@ -400,6 +401,7 @@ class RdpClient(
         if (length < 4) return false
         val data = ByteArray(length - 4)
         inputStream?.readFully(data) ?: return false
+        RdpLog.hex("X.224 CC raw bytes", header + data)
 
         if (data.isEmpty() || (data[1].toInt() and 0xFF) != 0xD0) return false
 
@@ -456,7 +458,7 @@ class RdpClient(
         sslSocketRef = sslSocket
         inputStream  = DataInputStream(BufferedInputStream(sslSocket.getInputStream(), 65536))
         outputStream = DataOutputStream(BufferedOutputStream(sslSocket.getOutputStream(), 65536))
-        RdpLog.d("TLS upgraded: ${sslSocket.session.protocol}")
+        RdpLog.d("TLS upgraded: ${sslSocket.session.protocol} cipher=${sslSocket.session.cipherSuite}")
     }
 
     // ── NLA / CredSSP ──────────────────────────────────────────────────────
@@ -577,13 +579,18 @@ class RdpClient(
 
     // ── MCS ────────────────────────────────────────────────────────────────
 
-    private fun sendMcsConnectInitial() = sendTpkt(buildMcsConnectInitialPayload())
+    private fun sendMcsConnectInitial() {
+        val payload = buildMcsConnectInitialPayload()
+        RdpLog.hex("MCS Connect Initial payload (pre-TPKT)", payload, maxBytes = 2048)
+        sendTpkt(payload)
+    }
 
     private fun buildMcsConnectInitialPayload(): ByteArray {
         val coreData    = buildClientCoreData()
         val secData     = buildClientSecurityData()
         val netData     = buildClientNetworkData()
         val clusterData = buildClientClusterData()
+        RdpLog.d("GCC userData block sizes: core=${coreData.size} sec=${secData.size} net=${netData.size} cluster=${clusterData.size} total=${coreData.size + secData.size + netData.size + clusterData.size}")
         return wrapInGccConferenceCreateRequest(coreData + secData + netData + clusterData)
     }
 
@@ -882,6 +889,7 @@ class RdpClient(
             RdpLog.e("MCS Connect Response: no data received — socket closed or read timeout")
             return false
         }
+        RdpLog.hex("MCS Connect Response raw bytes", packet, maxBytes = 1024)
         if (packet.isEmpty()) {
             RdpLog.e("MCS Connect Response: received empty packet")
             return false
@@ -1041,6 +1049,7 @@ class RdpClient(
         infoBuf.put(workBytes)
 
         val payload = secHeader.array() + infoBuf.array().copyOf(infoBuf.position())
+        RdpLog.d("Client Info PDU: domain='${credentials.domain}' user='${credentials.username}' passwordLen=${credentials.password.length} totalPayloadBytes=${payload.size}")
         sendMcsSendDataRequest(payload)
     }
 
@@ -1050,6 +1059,7 @@ class RdpClient(
         var foundDemandActive = false
         for (attempt in 0 until 10) {
             val raw = readX224Data() ?: break
+            RdpLog.hex("Post-MCS PDU attempt #$attempt raw bytes", raw, maxBytes = 256)
             val payload = stripMcsSendDataIndication(raw)
             if (payload.size >= 6) {
                 val pduType = payload[2].toInt() and 0xFF
@@ -1454,7 +1464,19 @@ class RdpClient(
             val dataLength = length - 4
             if (dataLength <= 0) return ByteArray(0)
             val data = ByteArray(dataLength); inputStream?.readFully(data); data
-        } catch (e: Exception) { null }
+        } catch (e: java.io.EOFException) {
+            RdpLog.e("readTpkt: EOFException — server closed the connection (sent FIN) before any/enough bytes arrived: ${e.message}")
+            null
+        } catch (e: java.net.SocketTimeoutException) {
+            RdpLog.e("readTpkt: SocketTimeoutException — no data arrived within ${READ_TIMEOUT_MS}ms (server went silent, did not close or respond): ${e.message}")
+            null
+        } catch (e: java.net.SocketException) {
+            RdpLog.e("readTpkt: SocketException — connection reset/aborted: ${e.message}")
+            null
+        } catch (e: Exception) {
+            RdpLog.e("readTpkt: unexpected ${e::class.java.simpleName}: ${e.message}", e)
+            null
+        }
     }
 
     private fun readX224Data(): ByteArray? {
