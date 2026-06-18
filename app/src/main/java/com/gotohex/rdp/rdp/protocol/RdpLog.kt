@@ -59,6 +59,30 @@ object RdpLog {
         append("E", msg, t)
     }
 
+    /**
+     * Logs a labeled hex dump of raw bytes, e.g. for inspecting exactly what
+     * was sent/received at a given protocol step. Output is wrapped at 16
+     * bytes per line so it stays readable when copy/shared from the error
+     * screen. Truncates very large buffers (e.g. bitmap data) to keep the
+     * trace readable — full length is always shown in the label.
+     */
+    fun hex(label: String, data: ByteArray, maxBytes: Int = 512) {
+        val shown = data.size > maxBytes
+        val toPrint = if (shown) data.copyOf(maxBytes) else data
+        val sb = StringBuilder()
+        sb.append("$label (${data.size} bytes${if (shown) ", showing first $maxBytes" else ""}):\n")
+        var i = 0
+        while (i < toPrint.size) {
+            val end = minOf(i + 16, toPrint.size)
+            val lineBytes = toPrint.copyOfRange(i, end)
+            val hexPart = lineBytes.joinToString(" ") { "%02X".format(it) }
+            sb.append("  ").append(hexPart).append("\n")
+            i = end
+        }
+        if (toPrint.isEmpty()) sb.append("  (empty)\n")
+        d(sb.toString().trimEnd())
+    }
+
     /** Clears the buffer. Call at the start of each connect() attempt. */
     fun clear() = lines.clear()
 
