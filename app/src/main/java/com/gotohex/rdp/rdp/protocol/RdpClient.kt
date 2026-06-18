@@ -22,44 +22,17 @@ import java.security.cert.X509Certificate
  * Maximum compatibility: Windows XP/7/8/8.1/10/11, Server 2008-2022, xrdp/Linux
  *
  * ═══════════════════════════════════════════════════════════════════
- * FIXES APPLIED IN THIS REVISION (v5 → v6):
+ * FIXES APPLIED IN THIS REVISION (v6 → v7):
  *
- * BUG-A  CRITICAL: writePerLength() used BER-style length encoding
- *         (0x81/0x82 prefix) instead of FreeRDP's PER encoding.
- *         PER length >= 128 must be: 0x80|(len>>8), len&0xFF  (always 2 bytes).
- *         BER-style 0x82 produces a 3-byte field where 2 bytes are expected,
- *         shifting every subsequent byte in the GCC Conference Create Request
- *         and causing the server to reject MCS Connect Initial.
- *         Fix: rewrite writePerLength() to match per_write_length() in FreeRDP.
+ * BUG-G  CRITICAL: GCC Conference Create Request inside MCS Connect
+ *         Initial's userData must be wrapped in an ASN.1 SEQUENCE
+ *         (tag 0x30) before being placed in the OCTET STRING.
+ *         The previous code wrote the raw PER choice directly,
+ *         causing the server to immediately RST the connection.
+ *         Fix: wrap gccRequest in SEQUENCE in wrapInGccConferenceCreateRequest().
  *
- * BUG-B  CRITICAL: Numeric string "1" in buildGccConferenceCreateRequest()
- *         was encoded as 0x01 0x31 (raw ASCII) instead of FreeRDP's
- *         per_write_numeric_string("1",1,1) output: 0x00 0x10
- *         (per_write_length(1-1=0)=0x00, then BCD nibble (1<<4)|0=0x10).
- *         Fix: write 0x00, 0x10 directly.
- *
- * BUG-C  CRITICAL: h221 key "Duca" was missing its PER octet-string
- *         length byte. per_write_octet_string(key,4,4) must first write
- *         per_write_length(4-4=0) = 0x00, then the 4 bytes.
- *         Without this 0x00, the parser sees "Duca" as the length field,
- *         misaligning everything that follows.
- *         Fix: write 0x00 before "Duca".
- *
- * BUG-D  CRITICAL: berIntegerMinimal() encoded values 32768-65535
- *         using 2 content bytes (e.g. 65535 → 02 02 FF FF).
- *         In BER, FF FF is the signed integer -1, not 65535.
- *         FreeRDP's ber_write_integer() uses threshold < 0x8000 for 2 bytes,
- *         so 65535 (≥ 0x8000) requires 3 bytes with a leading 0x00:
- *         02 03 00 FF FF = +65535.
- *         Fix: rewrite berIntegerMinimal() to match FreeRDP thresholds.
- *
- * BUG-E  MINOR: buildClientCoreData() used putShort(1) for
- *         desktopScaleFactor and deviceScaleFactor, which are UINT32 fields.
- *         Fix: changed to putInt(1).
- *
- * BUG-F  MINOR: readMcsConnectResponse() skipped ENUMERATED by pos+=2
- *         (tag+length only), missing the value byte. Changed to pos+=3.
- *
+ * Previous fixes: A (PER length), B (numeric string), C (h221 key prefix),
+ * D (BER integer 65535), E (scale factors), F (ENUMERATED skip).
  * ═══════════════════════════════════════════════════════════════════
  */
 class RdpClient(
@@ -688,6 +661,11 @@ class RdpClient(
     private fun wrapInGccConferenceCreateRequest(userData: ByteArray): ByteArray {
         val gccRequest = buildGccConferenceCreateRequest(userData)
 
+        // FIX BUG-G: GCC Conference Create Request must be enclosed in
+        // an ASN.1 SEQUENCE (tag 0x30) before being placed inside the
+        // OCTET STRING of the MCS Connect Initial's userData.
+        val gccSeq = byteArrayOf(0x30) + berLengthBytes(gccRequest.size) + gccRequest
+
         val targetParams  = buildDomainParameters(34,    3,     0,     1, 0, 1, 65535, 2)
         val minimumParams = buildDomainParameters(1,     1,     1,     1, 0, 1,  1056, 2)
         val maximumParams = buildDomainParameters(65535, 64535, 65535, 1, 0, 1, 65535, 2)
@@ -698,7 +676,7 @@ class RdpClient(
             0x04, 0x01, 0x01,           // calledDomainSelector  OCTET STRING
             0x01, 0x01, 0xFF.toByte()   // upwardFlag BOOLEAN TRUE
         ) + targetParams + minimumParams + maximumParams +
-            byteArrayOf(0x04) + berLengthBytes(gccRequest.size) + gccRequest
+            byteArrayOf(0x04) + berLengthBytes(gccSeq.size) + gccSeq   // use wrapped gccSeq here
 
         // APPLICATION 101 outer wrapper (BER)
         val out = ByteArrayOutputStream()
@@ -957,14 +935,81 @@ class RdpClient(
 
         // userData OCTET STRING
         if (pos + 2 <= packet.size && (packet[pos].toInt() and 0xFF) == 0x04) {
-            val udLen = packet[pos + 1].toInt() and 0xFF
-            pos += 2
-            RdpLog.d("MCS Connect Response: GCC data at offset $pos, length $udLen — OK")
+            // FIX: previous code read udLen as a single raw byte
+            // (packet[pos+1]), which only works if the BER length happens to
+            // be < 128. GCC userData in a real Connect Response (core+security
+            // +network server data, often including a certificate) is
+            // typically several hundred bytes, so the BER length is almost
+            // always long-form (0x81/0x82 prefix). Use readBerLength() here
+            // too, consistent with how the outer wrapper length is parsed.
+            val (udLen, udLenBytes) = readBerLength(packet, pos + 1)
+            pos += 1 + udLenBytes
+            RdpLog.d("MCS Connect Response: GCC userData at offset $pos, length $udLen — OK")
+            if (pos + udLen <= packet.size) {
+                scanGccServerData(packet, pos, udLen)
+            } else {
+                RdpLog.w("MCS Connect Response: GCC userData length $udLen exceeds remaining packet size, cannot scan")
+            }
             return true
         }
 
         RdpLog.d("MCS Connect Response: could not locate userData OCTET STRING, accepting leniently")
         return true
+    }
+
+    /**
+     * Diagnostic-only scan of the GCC Conference Create Response user data
+     * blocks (TS_UD_SC_CORE / TS_UD_SC_SECURITY1 / TS_UD_SC_NET), looking
+     * specifically for the Server Security Data block so we can log the
+     * encryptionMethod/encryptionLevel the server selected.
+     *
+     * Per MS-RDPBCGR, the Security Exchange PDU (client RSA-encrypted random)
+     * is only required if BOTH of these are non-zero; if the server returns
+     * zero/zero, Standard RDP Security is effectively disabled for this
+     * session and the Client Info PDU is sent directly with no security
+     * handshake — which is what this client currently always does.
+     * This function does not yet perform that handshake; it only reports
+     * what the server is asking for, so we can confirm whether implementing
+     * it is actually necessary for this server before writing the RSA/RC4
+     * key-exchange code.
+     */
+    private fun scanGccServerData(packet: ByteArray, start: Int, len: Int) {
+        var pos = start
+        val end = start + len
+        while (pos + 4 <= end) {
+            val blockType = ((packet[pos + 1].toInt() and 0xFF) shl 8) or (packet[pos].toInt() and 0xFF)
+            val blockLen  = ((packet[pos + 3].toInt() and 0xFF) shl 8) or (packet[pos + 2].toInt() and 0xFF)
+            if (blockLen < 4 || pos + blockLen > end) {
+                RdpLog.w("scanGccServerData: block at $pos has invalid length $blockLen, stopping scan")
+                break
+            }
+            when (blockType) {
+                0x0C01 -> RdpLog.d("scanGccServerData: TS_UD_SC_CORE block (len=$blockLen)")
+                0x0C02 -> { // TS_UD_SC_SECURITY1
+                    if (blockLen >= 12) {
+                        val encMethod = ((packet[pos+7].toInt() and 0xFF) shl 24) or
+                                        ((packet[pos+6].toInt() and 0xFF) shl 16) or
+                                        ((packet[pos+5].toInt() and 0xFF) shl  8) or
+                                         (packet[pos+4].toInt() and 0xFF)
+                        val encLevel  = ((packet[pos+11].toInt() and 0xFF) shl 24) or
+                                        ((packet[pos+10].toInt() and 0xFF) shl 16) or
+                                        ((packet[pos+9].toInt() and 0xFF) shl  8) or
+                                         (packet[pos+8].toInt() and 0xFF)
+                        RdpLog.d("scanGccServerData: TS_UD_SC_SECURITY1 encryptionMethod=$encMethod encryptionLevel=$encLevel (len=$blockLen)")
+                        if (encMethod != 0 || encLevel != 0) {
+                            RdpLog.w("scanGccServerData: server requires Standard RDP Security key exchange (Security Exchange PDU) — NOT currently implemented by this client. This is likely why the server drops the connection before/around Client Info.")
+                        } else {
+                            RdpLog.d("scanGccServerData: server selected NO encryption (0/0) — Security Exchange PDU is not required, Client Info can be sent directly")
+                        }
+                    } else {
+                        RdpLog.w("scanGccServerData: TS_UD_SC_SECURITY1 block too short to read encryptionMethod/Level (len=$blockLen)")
+                    }
+                }
+                0x0C03 -> RdpLog.d("scanGccServerData: TS_UD_SC_NET block (len=$blockLen)")
+                else -> RdpLog.d("scanGccServerData: unknown block type 0x${blockType.toString(16)} (len=$blockLen)")
+            }
+            pos += blockLen
+        }
     }
 
     private fun readBerLength(data: ByteArray, offset: Int): Pair<Int, Int> {
@@ -1152,10 +1197,19 @@ class RdpClient(
         val buf = ByteBuffer.allocate(1024).order(ByteOrder.LITTLE_ENDIAN)
 
         // CAPSTYPE_GENERAL (0x0001) — 24 bytes
+        // Verified field-by-field against MS-RDPBCGR official Server/Client
+        // Active PDU hex captures: 01 00 18 00 01 00 03 00 00 02 00 00 00 1D 04
+        // 00 00 00 00 00 00 01 01 (24 bytes total). Fields after extraFlags are
+        // exactly 3 x UINT16 (updateCapabilityFlag, remoteUnshareFlag,
+        // generalCompressionLevel) + 2 x UINT8 — NOT 4 x UINT16. The previous
+        // code wrote an extra spurious putShort(0), producing 26 bytes while
+        // declaring length=24, which misaligns every capability set that
+        // follows for any server that trusts the declared length over byte
+        // scanning.
         buf.putShort(0x0001); buf.putShort(24)
         buf.putShort(1); buf.putShort(3); buf.putShort(0x0200)
         buf.putShort(0); buf.putShort(0); buf.putShort(0x0441)
-        buf.putShort(0); buf.putShort(0); buf.putShort(0); buf.putShort(0)
+        buf.putShort(0); buf.putShort(0); buf.putShort(0)
         buf.put(1); buf.put(1)
 
         // CAPSTYPE_BITMAP (0x0002) — 28 bytes
