@@ -22,17 +22,18 @@ import java.security.cert.X509Certificate
  * Maximum compatibility: Windows XP/7/8/8.1/10/11, Server 2008-2022, xrdp/Linux
  *
  * ═══════════════════════════════════════════════════════════════════
- * FIXES APPLIED IN THIS REVISION (v6 → v7):
+ * FIXES APPLIED IN THIS REVISION (v7 → v8):
  *
- * BUG-G  CRITICAL: GCC Conference Create Request inside MCS Connect
- *         Initial's userData must be wrapped in an ASN.1 SEQUENCE
- *         (tag 0x30) before being placed in the OCTET STRING.
- *         The previous code wrote the raw PER choice directly,
- *         causing the server to immediately RST the connection.
- *         Fix: wrap gccRequest in SEQUENCE in wrapInGccConferenceCreateRequest().
+ * BUG-H  CRITICAL: per_write_object_identifier for t124_02_98_oid
+ *         was hardcoded as 7 bytes (00 05 00 14 7C 00 01), causing
+ *         an extra leading 0x00. FreeRDP encodes it as 6 bytes:
+ *         05 (length) + 5 OID bytes (00 14 7C 00 01). This misalignment
+ *         caused the server to RST after MCS Connect Initial.
+ *         Fix: use the correct 6-byte sequence.
  *
  * Previous fixes: A (PER length), B (numeric string), C (h221 key prefix),
- * D (BER integer 65535), E (scale factors), F (ENUMERATED skip).
+ * D (BER integer 65535), E (scale factors), F (ENUMERATED skip),
+ * G (GCC SEQUENCE wrapper).
  * ═══════════════════════════════════════════════════════════════════
  */
 class RdpClient(
@@ -693,7 +694,7 @@ class RdpClient(
      * For userData of size N (typically ~266 bytes), the output is:
      *
      *   00                        per_write_choice(0)
-     *   00 05 00 14 7C 00 01      per_write_object_identifier(t124_02_98_oid)
+     *   05 00 14 7C 00 01         per_write_object_identifier(t124_02_98_oid)
      *   <PER length of N+14>      per_write_length(N+14)
      *   00                        per_write_choice(0)  [createRequest]
      *   08                        per_write_selection(0x08)
@@ -716,7 +717,8 @@ class RdpClient(
         s.write(0x00)
 
         // per_write_object_identifier(t124_02_98_oid)
-        s.write(byteArrayOf(0x00, 0x05, 0x00, 0x14, 0x7C, 0x00, 0x01))
+        // FIX BUG-H: correct PER encoding is 05 (length) + 5 OID bytes
+        s.write(byteArrayOf(0x05, 0x00, 0x14, 0x7C, 0x00, 0x01))
 
         // per_write_length(userData.size + 14) — length of ConferenceCreateRequest fields
         writePerLength(s, userData.size + 14)
