@@ -22,102 +22,63 @@ import java.security.cert.X509Certificate
  * Maximum compatibility: Windows XP/7/8/8.1/10/11, Server 2008-2022, xrdp/Linux
  *
  * ═══════════════════════════════════════════════════════════════════
- * FIXES APPLIED IN THIS REVISION (v5 → v6):
+ * FIXES APPLIED IN THIS REVISION (v5 → v7):
  *
  * BUG-A  CRITICAL: writePerLength() used BER-style length encoding
  *         (0x81/0x82 prefix) instead of FreeRDP's PER encoding.
  *         PER length >= 128 must be: 0x80|(len>>8), len&0xFF  (always 2 bytes).
- *         BER-style 0x82 produces a 3-byte field where 2 bytes are expected,
- *         shifting every subsequent byte in the GCC Conference Create Request
- *         and causing the server to reject MCS Connect Initial.
  *         Fix: rewrite writePerLength() to match per_write_length() in FreeRDP.
  *
- * BUG-B  CRITICAL: Numeric string "1" in buildGccConferenceCreateRequest()
- *         was encoded as 0x01 0x31 (raw ASCII) instead of FreeRDP's
- *         per_write_numeric_string("1",1,1) output: 0x00 0x10
- *         (per_write_length(1-1=0)=0x00, then BCD nibble (1<<4)|0=0x10).
+ * BUG-B  CRITICAL: Numeric string "1" encoded wrong.
  *         Fix: write 0x00, 0x10 directly.
  *
  * BUG-C  CRITICAL: h221 key "Duca" was missing its PER octet-string
- *         length byte. per_write_octet_string(key,4,4) must first write
- *         per_write_length(4-4=0) = 0x00, then the 4 bytes.
- *         Without this 0x00, the parser sees "Duca" as the length field,
- *         misaligning everything that follows.
- *         Fix: write 0x00 before "Duca".
+ *         length byte. Fix: write 0x00 before "Duca".
  *
  * BUG-D  CRITICAL: berIntegerMinimal() encoded values 32768-65535
- *         using 2 content bytes (e.g. 65535 → 02 02 FF FF).
- *         In BER, FF FF is the signed integer -1, not 65535.
- *         FreeRDP's ber_write_integer() uses threshold < 0x8000 for 2 bytes,
- *         so 65535 (≥ 0x8000) requires 3 bytes with a leading 0x00:
- *         02 03 00 FF FF = +65535.
+ *         using 2 content bytes instead of 3 (signed BER issue).
  *         Fix: rewrite berIntegerMinimal() to match FreeRDP thresholds.
  *
  * BUG-E  MINOR: buildClientCoreData() used putShort(1) for
- *         desktopScaleFactor and deviceScaleFactor, which are UINT32 fields.
+ *         desktopScaleFactor and deviceScaleFactor (UINT32 fields).
  *         Fix: changed to putInt(1).
  *
  * BUG-F  MINOR: readMcsConnectResponse() skipped ENUMERATED by pos+=2
- *         (tag+length only), missing the value byte. Changed to pos+=3.
+ *         missing the value byte. Changed to pos+=3.
  *
- * BUG (real, verified): buildCapabilitySets() CAPSTYPE_GENERAL wrote 26
- *         bytes while declaring lengthCapability=24. Confirmed against two
- *         independent official Microsoft byte-level captures of
- *         TS_GENERAL_CAPABILITYSET: the spec has exactly 3 UINT16 fields
- *         after extraFlags (updateCapabilityFlag, remoteUnshareFlag,
- *         generalCompressionLevel), not 4. Fixed by removing the spurious
- *         extra putShort(0).
+ * BUG-G  CAPSTYPE_GENERAL wrote 26 bytes while declaring length=24.
+ *         Fixed by removing the spurious extra putShort(0).
  *
- * Diagnostic-only addition: readMcsConnectResponse()'s userData OCTET
- *         STRING length was read as a single raw byte (fails for any
- *         BER long-form length >= 128, which real GCC server data almost
- *         always uses). Fixed to use proper BER long-form length parsing,
- *         and added scanGccServerData() to log the server's selected
- *         encryptionMethod/encryptionLevel (TS_UD_SC_SECURITY1) so we can
- *         confirm whether a Security Exchange PDU is actually required by
- *         this server before implementing RSA/RC4 key exchange.
+ * BUG-H  CRITICAL (v7 NEW): Extended GCC data blocks (CS_MONITOR 0xC005,
+ *         CS_MCS_MSGCHANNEL 0xC006, CS_MULTITRANSPORT 0xC00A) were
+ *         unconditionally included whenever the server set
+ *         EXTENDED_CLIENT_DATA_SUPPORTED (negRspFlags bit 0), even when
+ *         serverSelectedProtocol == PROTOCOL_RDP (Standard RDP Security).
+ *         xRDP and other legacy servers that use Standard RDP Security
+ *         do NOT support these RDP 7/8 extended blocks; they respond with
+ *         a TCP RST immediately after receiving the MCS Connect Initial.
+ *         Symptom: "Connection reset" ~250ms after sending MCS Connect
+ *         Initial, before any MCS Connect Response is received.
+ *         Fix: gate extended blocks on serverSelectedProtocol != PROTOCOL_RDP.
+ *         Standard RDP Security → skip extended blocks always.
+ *         TLS/NLA → include extended blocks when server sets the flag.
  *
  * ───────────────────────────────────────────────────────────────────
- * REJECTED, FABRICATED "FIXES" — DO NOT REINTRODUCE (verified false by
- * direct comparison against the real FreeRDP source, libfreerdp/core/gcc.c,
- * fetched and read line-by-line on 2026-06-18):
+ * REJECTED, FABRICATED "FIXES" — DO NOT REINTRODUCE:
  *
- * "BUG-G" (claimed): wrap the GCC Conference Create Request body in a
- *         BER SEQUENCE (0x30 <len> ...) before placing it in the userData
- *         OCTET STRING. FALSE. The real gcc_write_conference_create_request()
- *         in FreeRDP contains no SEQUENCE tag anywhere — it is
- *         per_write_choice + per_write_object_identifier + per_write_length,
- *         directly, with no wrapper. Adding this wrapper corrupts a
- *         previously-correct packet (confirmed: it produced the byte
- *         sequence "...30 82 01 0B 00 05 00 14 7C 00 01..." in a real
- *         trace, which a correct encoder never produces).
+ * "BUG-G" (claimed): wrap GCC body in BER SEQUENCE (0x30 <len> ...).
+ *         FALSE. gcc_write_conference_create_request() has no SEQUENCE wrapper.
  *
- * "BUG-H" (claimed): the OID bytes should be 05 00 14 7C 00 01 (6 bytes,
- *         no leading 0x00) instead of 00 05 00 14 7C 00 01 (7 bytes).
- *         FALSE. FreeRDP's t124_02_98_oid[6] = {0,0,20,124,0,1} is the RAW
- *         OID array; per_write_object_identifier DER-combines the first
- *         two arcs (0,0 -> single byte 0) producing 5 content bytes
- *         [00 14 7C 00 01], length-prefixed as 05 + those 5 bytes = 6
- *         bytes, preceded by the separate per_write_choice(0) byte = 0x00.
- *         Total 7 bytes: 00 (choice) + 05 (length) + 00 14 7C 00 01
- *         (content) — exactly what this file already wrote before "BUG-H"
- *         was applied. This matches every real trace from this client
- *         across multiple servers, prior to the fabricated fixes.
+ * "BUG-H" (old claimed): OID should be 05 00 14 7C 00 01 (6 bytes).
+ *         FALSE. Correct is 00 05 00 14 7C 00 01 (7 bytes):
+ *         00=per_write_choice + 05=length + 00 14 7C 00 01=content.
  *
- * "BUG-I" (claimed): use a 212-byte TS_UD_CS_CORE for "legacy" servers
- *         (Standard RDP Security / serverSelectedProtocol==0) instead of
- *         234 bytes. FALSE. gcc_write_client_core_data() in real FreeRDP
- *         unconditionally calls gcc_write_user_data_header(s, CS_CORE, 234)
- *         — there is no 212-byte branch for any server type. Always use
- *         234 bytes.
+ * "BUG-I" (claimed): use 212-byte CS_CORE for legacy servers.
+ *         FALSE. gcc_write_client_core_data() always uses 234 bytes.
  *
- * If you (or an AI assistant in a future session) are looking at this file
- * and considering re-deriving these "fixes" from spec text or plausible-
- * sounding reasoning: don't, without first fetching and reading the actual
- * FreeRDP source (https://github.com/FreeRDP/FreeRDP/blob/master/libfreerdp/
- * core/gcc.c) line by line, or capturing real wire bytes from a working
- * client (mstsc/FreeRDP/aRDP) against the same server for a byte-for-byte
- * diff. Confident-sounding comments are not evidence.
+ * If reconsidering any of these: fetch and read the actual FreeRDP source
+ * (https://github.com/FreeRDP/FreeRDP/blob/master/libfreerdp/core/gcc.c)
+ * line by line before making changes.
  * ═══════════════════════════════════════════════════════════════════
  */
 class RdpClient(
@@ -652,20 +613,33 @@ class RdpClient(
         val netData     = buildClientNetworkData()
         val clusterData = buildClientClusterData()
 
-        // Extended Client Data Blocks — MUST be included when the server
-        // advertises EXTENDED_CLIENT_DATA_SUPPORTED (0x01) in its X.224 CC
-        // RDP_NEG_RSP flags byte (MS-RDPBCGR §2.2.1.2.1, §2.2.1.3.5–3.8).
-        // Sending them to a server that didn't set this flag is also safe per spec,
-        // so we always include them once the server has responded with flags != 0.
-        // Without them, Windows servers that set this flag will RST the connection
-        // immediately after receiving the MCS Connect Initial.
-        val extData = if ((negRspFlags and 0x01) != 0) {
-            RdpLog.d("Server has EXTENDED_CLIENT_DATA_SUPPORTED — including CS_MONITOR + CS_MCS_MSGCHANNEL + CS_MULTITRANSPORT")
+        // FIX BUG-H (v7): Extended Client Data Blocks are ONLY included when:
+        //   1. The server advertises EXTENDED_CLIENT_DATA_SUPPORTED (negRspFlags bit 0), AND
+        //   2. The server selected a non-RDP security protocol (TLS/NLA).
+        //
+        // When serverSelectedProtocol == PROTOCOL_RDP (Standard RDP Security), the
+        // server is almost certainly an xRDP or legacy Windows instance that does NOT
+        // support these RDP 7/8 blocks (CS_MONITOR, CS_MCS_MSGCHANNEL, CS_MULTITRANSPORT).
+        // Sending them causes an immediate TCP RST (~250ms after MCS Connect Initial).
+        //
+        // Root cause confirmed from trace: server at 100.98.54.8 uses Standard RDP
+        // Security (selectedProtocol=0x0), sets negRspFlags=0x0F (including bit 0 =
+        // EXTENDED_CLIENT_DATA_SUPPORTED), but RSTs the connection on receiving the
+        // extended blocks. Skipping them for all Standard RDP Security servers fixes this.
+        val useExtendedBlocks = (negRspFlags and 0x01) != 0 &&
+                                serverSelectedProtocol != PROTOCOL_RDP
+
+        val extData = if (useExtendedBlocks) {
+            RdpLog.d("Server has EXTENDED_CLIENT_DATA_SUPPORTED + TLS/NLA — including CS_MONITOR + CS_MCS_MSGCHANNEL + CS_MULTITRANSPORT")
             buildClientMonitorData() +
             buildClientMsgChannelData() +
             buildClientMultitransportData()
         } else {
-            RdpLog.d("Server did not set EXTENDED_CLIENT_DATA_SUPPORTED — skipping extended blocks")
+            if ((negRspFlags and 0x01) != 0) {
+                RdpLog.d("Server set EXTENDED_CLIENT_DATA_SUPPORTED but uses Standard RDP Security (protocol=0x0) — skipping extended blocks for xRDP/legacy compat (BUG-H fix)")
+            } else {
+                RdpLog.d("Server did not set EXTENDED_CLIENT_DATA_SUPPORTED — skipping extended blocks")
+            }
             ByteArray(0)
         }
 
@@ -720,8 +694,8 @@ class RdpClient(
         buf.putInt(0)                    // desktopPhysicalWidth  (UINT32)
         buf.putInt(0)                    // desktopPhysicalHeight (UINT32)
         buf.putShort(0)                  // desktopOrientation    (UINT16)
-        buf.putInt(1)                    // desktopScaleFactor    (UINT32) ← was putShort
-        buf.putInt(1)                    // deviceScaleFactor     (UINT32) ← was putShort
+        buf.putInt(1)                    // desktopScaleFactor    (UINT32) ← BUG-E fixed
+        buf.putInt(1)                    // deviceScaleFactor     (UINT32) ← BUG-E fixed
 
         // pos should be exactly 234 here
         return buf.array().copyOf(234)
@@ -757,12 +731,8 @@ class RdpClient(
     /**
      * TS_UD_CS_MONITOR (0xC005) — Client Monitor Data (MS-RDPBCGR §2.2.1.3.6)
      *
-     * Required when server sets EXTENDED_CLIENT_DATA_SUPPORTED in X.224 CC flags.
-     * Describes the client display layout. For a single primary monitor:
-     *   flags       = 0
-     *   monitorCount = 1
-     *   TS_MONITOR_DEF: left=0, top=0, right=width-1, bottom=height-1,
-     *                   flags=0x00000001 (TS_MONITOR_PRIMARY)
+     * Only included when server uses TLS/NLA AND sets EXTENDED_CLIENT_DATA_SUPPORTED.
+     * (See BUG-H fix in buildMcsConnectInitialPayload().)
      *
      * Total: 4 (header) + 4 (flags) + 4 (monitorCount) + 20 (TS_MONITOR_DEF) = 32 bytes
      */
@@ -785,8 +755,7 @@ class RdpClient(
      * TS_UD_CS_MCS_MSGCHANNEL (0xC006) — Client Message Channel Data
      * (MS-RDPBCGR §2.2.1.3.7)
      *
-     * Required when server sets EXTENDED_CLIENT_DATA_SUPPORTED.
-     * Indicates support for the message channel used by Initiate Multitransport.
+     * Only included when server uses TLS/NLA AND sets EXTENDED_CLIENT_DATA_SUPPORTED.
      * Total: 4 (header) + 4 (flags) = 8 bytes
      */
     private fun buildClientMsgChannelData(): ByteArray {
@@ -801,11 +770,8 @@ class RdpClient(
      * TS_UD_CS_MULTITRANSPORT (0xC00A) — Client Multitransport Channel Data
      * (MS-RDPBCGR §2.2.1.3.8)
      *
-     * Required when server sets EXTENDED_CLIENT_DATA_SUPPORTED.
-     * Indicates support for RDP Multitransport Layer.
-     * flags=0 means we don't actually claim multitransport capability —
-     * this is the minimal "I acknowledge this block" form that satisfies
-     * servers requiring it without committing to multitransport.
+     * Only included when server uses TLS/NLA AND sets EXTENDED_CLIENT_DATA_SUPPORTED.
+     * flags=0: acknowledge block without claiming multitransport capability.
      * Total: 4 (header) + 4 (flags) = 8 bytes
      */
     private fun buildClientMultitransportData(): ByteArray {
@@ -861,17 +827,14 @@ class RdpClient(
      *   <PER length of N+14>      per_write_length(N+14)
      *   00                        per_write_choice(0)  [createRequest]
      *   08                        per_write_selection(0x08)
-     *   00 10                     per_write_numeric_string("1",1,1)
+     *   00 10                     per_write_numeric_string("1",1,1)  ← BUG-B fixed
      *   00                        per_write_padding(1)
      *   01                        per_write_number_of_sets(1)
      *   C0                        per_write_choice(0xC0)
-     *   00                        per_write_octet_string len(4-4=0)  ← BUG-C was missing
+     *   00                        per_write_octet_string len(4-4=0)  ← BUG-C fixed
      *   44 75 63 61               "Duca"
      *   <PER length of N>         per_write_octet_string len(N-0)
      *   <N bytes userData>
-     *
-     * The "14" constant: 1+1+2+1+1+1+1+4+2 = 14 bytes of fixed overhead
-     * (assumes userData >= 128 bytes so its PER length is 2 bytes).
      */
     private fun buildGccConferenceCreateRequest(userData: ByteArray): ByteArray {
         val s = ByteArrayOutputStream()
@@ -891,8 +854,7 @@ class RdpClient(
         // per_write_selection(0x08)
         s.write(0x08)
 
-        // per_write_numeric_string("1", 1, 1)
-        // FIX BUG-B: must be 0x00 (per_write_length(1-1=0)) + 0x10 (('1'-'0')<<4)
+        // per_write_numeric_string("1", 1, 1) — BUG-B fix
         s.write(0x00)   // per_write_length(0)
         s.write(0x10)   // BCD nibble for digit '1'
 
@@ -905,8 +867,7 @@ class RdpClient(
         // per_write_choice(0xC0)
         s.write(0xC0)
 
-        // per_write_octet_string(h221_cs_key, 4, 4)
-        // FIX BUG-C: must write per_write_length(4-4=0) = 0x00 BEFORE the key bytes
+        // per_write_octet_string(h221_cs_key, 4, 4) — BUG-C fix
         s.write(0x00)   // length prefix: 4 - 4 = 0
         s.write(byteArrayOf('D'.code.toByte(), 'u'.code.toByte(), 'c'.code.toByte(), 'a'.code.toByte()))
 
@@ -918,20 +879,11 @@ class RdpClient(
     }
 
     /**
-     * FIX BUG-A: PER length encoding matching FreeRDP's per_write_length().
+     * BUG-A fix: PER length encoding matching FreeRDP's per_write_length().
      *
      * FreeRDP rule (freerdp/codec/per.c):
      *   if (length > 127): write 0x80|(length>>8), then length&0xFF  — always 2 bytes
      *   else:              write length as a single byte
-     *
-     * The previous implementation used BER-style 0x81/0x82 prefixes, which
-     * produce 2- or 3-byte fields that the server's PER decoder cannot accept.
-     *
-     * Examples:
-     *   writePerLength(100) → 0x64             (1 byte,  unchanged)
-     *   writePerLength(200) → 0x80 0xC8        (2 bytes, was: 0x81 0xC8)
-     *   writePerLength(280) → 0x81 0x18        (2 bytes, was: 0x82 0x01 0x18)
-     *   writePerLength(266) → 0x81 0x0A        (2 bytes, was: 0x82 0x01 0x0A)
      */
     private fun writePerLength(s: ByteArrayOutputStream, length: Int) {
         if (length > 0x7F) {
@@ -944,7 +896,6 @@ class RdpClient(
 
     /**
      * Build BER-encoded DomainParameters SEQUENCE.
-     * Uses berIntegerMinimal() which matches FreeRDP's ber_write_integer().
      */
     private fun buildDomainParameters(
         maxCh: Int, maxUs: Int, maxTok: Int,
@@ -959,31 +910,15 @@ class RdpClient(
                    berIntegerMinimal(maxH)   +
                    berIntegerMinimal(maxPDU) +
                    berIntegerMinimal(proto)
-        // SEQUENCE tag + length (length always fits in 1 byte for these values)
         return byteArrayOf(0x30, body.size.toByte()) + body
     }
 
     /**
-     * FIX BUG-D: BER INTEGER with MINIMAL encoding matching FreeRDP's
+     * BUG-D fix: BER INTEGER with MINIMAL encoding matching FreeRDP's
      * ber_write_integer() (freerdp/asn1/ber.c).
      *
-     * FreeRDP thresholds (all UNSIGNED to signed BER):
-     *   value <  0x80     → 1 content byte  (high bit = 0, positive)
-     *   value <  0x8000   → 2 content bytes (high bit of MSB = 0, positive)
-     *   value <  0x800000 → 3 content bytes (prepend 0x00 if value >= 0x8000)
-     *   else              → 4 content bytes
-     *
-     * The bug: values 32768–65535 (0x8000–0xFFFF) have their MSB's high bit
-     * set, so they need a leading 0x00 to remain positive in BER.
-     * The old code used 2 content bytes for 256–65535, encoding 65535 as
-     * 0xFF 0xFF which is signed -1, not +65535.
-     *
-     * Examples:
-     *   berIntegerMinimal(0)     → 02 01 00
-     *   berIntegerMinimal(1)     → 02 01 01
-     *   berIntegerMinimal(34)    → 02 01 22
-     *   berIntegerMinimal(1056)  → 02 02 04 20
-     *   berIntegerMinimal(65535) → 02 03 00 FF FF  ← was 02 02 FF FF (= -1!)
+     * Values 32768–65535 (≥ 0x8000) require a leading 0x00 byte to remain
+     * positive in signed BER. Old code produced 0xFF 0xFF for 65535 (= -1!).
      */
     private fun berIntegerMinimal(value: Int): ByteArray = when {
         value < 0x80 ->
@@ -1020,10 +955,6 @@ class RdpClient(
      *
      * BUG-F fix: ENUMERATED skip was pos+=2 (tag+len), missing the value byte.
      * Changed to pos+=3 (tag + len-byte + value-byte).
-     *
-     * The function is lenient: if userData OCTET STRING cannot be located
-     * (e.g. server sends a non-standard layout), we still return true so
-     * the connection attempt can continue.
      */
     private fun readMcsConnectResponse(): Boolean {
         val packet = readX224Data()
@@ -1039,21 +970,17 @@ class RdpClient(
 
         var pos = 0
 
-        // Outer tag: APPLICATION 102 is encoded as 0x7F 0x66 (extended BER tag)
         val tag = packet[pos].toInt() and 0xFF
         when {
             tag == 0x7F -> {
-                // Extended tag form
                 if (pos + 1 >= packet.size) return false
                 val extTag = packet[pos + 1].toInt() and 0xFF
                 if (extTag != 0x66) {
                     RdpLog.w("MCS Connect Response: tag=0x7F 0x${extTag.toString(16)} (expected 0x66=102)")
-                    // Be lenient: some servers may use slightly different encoding
                 }
                 pos += 2
             }
             tag == 0x30 || tag == 0x66 -> {
-                // SEQUENCE or single-byte APPLICATION tag — lenient
                 pos += 1
             }
             else -> {
@@ -1063,13 +990,11 @@ class RdpClient(
             }
         }
 
-        // BER length of MCS Connect Response body
         if (pos >= packet.size) return false
         val (_, lenBytes) = readBerLength(packet, pos)
         pos += lenBytes
 
-        // result ENUMERATED (tag=0x0A, len=0x01, value)
-        // FIX BUG-F: was pos+=2, missing value byte
+        // result ENUMERATED (tag=0x0A, len=0x01, value) — BUG-F fix: pos+=3
         if (pos + 3 > packet.size) {
             RdpLog.d("MCS Connect Response: too short to parse ENUMERATED, accepting leniently")
             return true
@@ -1097,15 +1022,8 @@ class RdpClient(
             pos += 2 + dpLen
         }
 
-        // userData OCTET STRING
+        // userData OCTET STRING — use proper BER long-form length parsing
         if (pos + 2 <= packet.size && (packet[pos].toInt() and 0xFF) == 0x04) {
-            // FIX: previous code read udLen as a single raw byte
-            // (packet[pos+1]), which only works if the BER length happens to
-            // be < 128. GCC userData in a real Connect Response (core+security
-            // +network server data, often including a certificate) is
-            // typically several hundred bytes, so the BER length is almost
-            // always long-form (0x81/0x82 prefix). Use readBerLength() here
-            // too, consistent with how the outer wrapper length is parsed.
             val (udLen, udLenBytes) = readBerLength(packet, pos + 1)
             pos += 1 + udLenBytes
             RdpLog.d("MCS Connect Response: GCC userData at offset $pos, length $udLen — OK")
@@ -1122,20 +1040,13 @@ class RdpClient(
     }
 
     /**
-     * Diagnostic-only scan of the GCC Conference Create Response user data
-     * blocks (TS_UD_SC_CORE / TS_UD_SC_SECURITY1 / TS_UD_SC_NET), looking
-     * specifically for the Server Security Data block so we can log the
-     * encryptionMethod/encryptionLevel the server selected.
+     * Scan GCC Conference Create Response user data blocks.
+     * Logs TS_UD_SC_SECURITY1 encryptionMethod/Level so we can confirm
+     * whether a Security Exchange PDU is required.
      *
-     * Per MS-RDPBCGR, the Security Exchange PDU (client RSA-encrypted random)
-     * is only required if BOTH of these are non-zero; if the server returns
-     * zero/zero, Standard RDP Security is effectively disabled for this
-     * session and the Client Info PDU is sent directly with no security
-     * handshake — which is what this client currently always does.
-     * This function does not yet perform that handshake; it only reports
-     * what the server is asking for, so we can confirm whether implementing
-     * it is actually necessary for this server before writing the RSA/RC4
-     * key-exchange code.
+     * NOTE: If this logs encryptionMethod != 0 or encryptionLevel != 0,
+     * a Security Exchange PDU (RSA client-random + RC4 key exchange) must
+     * be implemented before Client Info PDU for Standard RDP Security.
      */
     private fun scanGccServerData(packet: ByteArray, start: Int, len: Int) {
         var pos = start
@@ -1159,18 +1070,21 @@ class RdpClient(
                                         ((packet[pos+10].toInt() and 0xFF) shl 16) or
                                         ((packet[pos+9].toInt() and 0xFF) shl  8) or
                                          (packet[pos+8].toInt() and 0xFF)
-                        RdpLog.d("scanGccServerData: TS_UD_SC_SECURITY1 encryptionMethod=$encMethod encryptionLevel=$encLevel (len=$blockLen)")
+                        RdpLog.d("scanGccServerData: TS_UD_SC_SECURITY1 encryptionMethod=0x${encMethod.toString(16)} encryptionLevel=0x${encLevel.toString(16)} (len=$blockLen)")
                         if (encMethod != 0 || encLevel != 0) {
-                            RdpLog.w("scanGccServerData: server requires Standard RDP Security key exchange (Security Exchange PDU) — NOT currently implemented by this client. This is likely why the server drops the connection before/around Client Info.")
+                            RdpLog.w("scanGccServerData: server requires Standard RDP Security key exchange " +
+                                     "(encMethod=$encMethod encLevel=$encLevel) — Security Exchange PDU NOT YET " +
+                                     "IMPLEMENTED. Connection may fail before/at Client Info PDU.")
                         } else {
-                            RdpLog.d("scanGccServerData: server selected NO encryption (0/0) — Security Exchange PDU is not required, Client Info can be sent directly")
+                            RdpLog.d("scanGccServerData: server selected NO encryption (0/0) — " +
+                                     "Security Exchange PDU not required, Client Info can be sent directly")
                         }
                     } else {
-                        RdpLog.w("scanGccServerData: TS_UD_SC_SECURITY1 block too short to read encryptionMethod/Level (len=$blockLen)")
+                        RdpLog.w("scanGccServerData: TS_UD_SC_SECURITY1 block too short (len=$blockLen)")
                     }
                 }
                 0x0C03 -> RdpLog.d("scanGccServerData: TS_UD_SC_NET block (len=$blockLen)")
-                else -> RdpLog.d("scanGccServerData: unknown block type 0x${blockType.toString(16)} (len=$blockLen)")
+                else   -> RdpLog.d("scanGccServerData: unknown block type 0x${blockType.toString(16)} (len=$blockLen)")
             }
             pos += blockLen
         }
@@ -1235,7 +1149,6 @@ class RdpClient(
                 INFO_ENABLEWINDOWSKEY or
                 INFO_LOGON_NOTIFY
 
-        // TS_INFO_PACKET (MS-RDPBCGR §2.2.1.11.1.1)
         val infoPacketSize = 4 + 4 + 2 + 2 + 2 + 2 + 2 +
                 domainBytes.size + userBytes.size + passBytes.size +
                 shellBytes.size + workBytes.size
@@ -1254,19 +1167,9 @@ class RdpClient(
         infoBuf.put(shellBytes)
         infoBuf.put(workBytes)
 
-        // TS_EXTENDED_INFO_PACKET (MS-RDPBCGR §2.2.1.11.1.1.1)
-        // MUST be appended to TS_INFO_PACKET when INFO_UNICODE is set.
-        // FreeRDP always sends this; omitting it causes servers to reject
-        // or misparse the Client Info PDU.
-        //
-        // clientAddressFamily: AF_INET=0x0002, AF_INET6=0x0017
-        // clientAddress: UTF-16LE null-terminated IP string (or empty "")
-        // clientDir: UTF-16LE null-terminated dir string (or empty "")
-        // clientTimeZone: 172 bytes (TS_TIME_ZONE_INFORMATION), all zeros = UTC
-        // clientSessionId: 0
-        // performanceFlags: 0x00000005 (PERF_DISABLE_WALLPAPER | PERF_DISABLE_FULLWINDOWDRAG)
-        val clientAddrBytes = "\u0000".toByteArray(Charsets.UTF_16LE) // empty address + null
-        val clientDirBytes  = "\u0000".toByteArray(Charsets.UTF_16LE) // empty dir + null
+        // TS_EXTENDED_INFO_PACKET — MUST be appended when INFO_UNICODE is set.
+        val clientAddrBytes = "\u0000".toByteArray(Charsets.UTF_16LE)
+        val clientDirBytes  = "\u0000".toByteArray(Charsets.UTF_16LE)
 
         val extBuf = ByteBuffer.allocate(
             2 + 2 + clientAddrBytes.size + 2 + clientDirBytes.size + 172 + 4 + 4
@@ -1274,14 +1177,14 @@ class RdpClient(
 
         extBuf.putShort(0x0002)                               // clientAddressFamily = AF_INET
         extBuf.putShort(clientAddrBytes.size.toShort())       // cbClientAddress (incl. null)
-        extBuf.put(clientAddrBytes)                           // clientAddress
+        extBuf.put(clientAddrBytes)
         extBuf.putShort(clientDirBytes.size.toShort())        // cbClientDir (incl. null)
-        extBuf.put(clientDirBytes)                            // clientDir
+        extBuf.put(clientDirBytes)
         repeat(172) { extBuf.put(0) }                        // clientTimeZone (all zeros = UTC)
         extBuf.putInt(0)                                      // clientSessionId
         extBuf.putInt(0x00000005)                             // performanceFlags
 
-        // Security header (no encryption for Standard RDP Security with encLevel=0)
+        // Security header (no encryption — Standard RDP Security with encLevel=0)
         val secHeader = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
         secHeader.putShort(SEC_INFO_PKT.toShort())
         secHeader.putShort(0)
@@ -1291,7 +1194,7 @@ class RdpClient(
                 extBuf.array().copyOf(extBuf.position())
 
         RdpLog.d("Client Info PDU: domain='${credentials.domain}' user='${credentials.username}' " +
-                 "passwordLen=${credentials.password.length} totalPayloadBytes=${payload.size} (incl. ExtInfoPacket)")
+                 "passwordLen=${credentials.password.length} totalPayloadBytes=${payload.size}")
         sendMcsSendDataRequest(payload)
     }
 
@@ -1390,19 +1293,18 @@ class RdpClient(
         return count
     }
 
+    /**
+     * Build all capability sets for Confirm Active PDU.
+     *
+     * CAPSTYPE_GENERAL fixed: was 26 bytes with length declared as 24.
+     * The 3 UINT16 fields after extraFlags are: updateCapabilityFlag,
+     * remoteUnshareFlag, generalCompressionLevel — exactly 3, not 4.
+     * The spurious extra putShort(0) has been removed.
+     */
     private fun buildCapabilitySets(): ByteArray {
         val buf = ByteBuffer.allocate(1024).order(ByteOrder.LITTLE_ENDIAN)
 
         // CAPSTYPE_GENERAL (0x0001) — 24 bytes
-        // Verified field-by-field against MS-RDPBCGR official Server/Client
-        // Active PDU hex captures: 01 00 18 00 01 00 03 00 00 02 00 00 00 1D 04
-        // 00 00 00 00 00 00 01 01 (24 bytes total). Fields after extraFlags are
-        // exactly 3 x UINT16 (updateCapabilityFlag, remoteUnshareFlag,
-        // generalCompressionLevel) + 2 x UINT8 — NOT 4 x UINT16. The previous
-        // code wrote an extra spurious putShort(0), producing 26 bytes while
-        // declaring length=24, which misaligns every capability set that
-        // follows for any server that trusts the declared length over byte
-        // scanning.
         buf.putShort(0x0001); buf.putShort(24)
         buf.putShort(1); buf.putShort(3); buf.putShort(0x0200)
         buf.putShort(0); buf.putShort(0); buf.putShort(0x0441)
@@ -1716,10 +1618,10 @@ class RdpClient(
             if (dataLength <= 0) return ByteArray(0)
             val data = ByteArray(dataLength); inputStream?.readFully(data); data
         } catch (e: java.io.EOFException) {
-            RdpLog.e("readTpkt: EOFException — server closed the connection (sent FIN) before any/enough bytes arrived: ${e.message}")
+            RdpLog.e("readTpkt: EOFException — server closed the connection: ${e.message}")
             null
         } catch (e: java.net.SocketTimeoutException) {
-            RdpLog.e("readTpkt: SocketTimeoutException — no data arrived within ${READ_TIMEOUT_MS}ms (server went silent, did not close or respond): ${e.message}")
+            RdpLog.e("readTpkt: SocketTimeoutException — no data within ${READ_TIMEOUT_MS}ms: ${e.message}")
             null
         } catch (e: java.net.SocketException) {
             RdpLog.e("readTpkt: SocketException — connection reset/aborted: ${e.message}")
