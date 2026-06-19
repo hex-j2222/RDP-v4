@@ -91,8 +91,9 @@ class RdpClient(
     companion object {
         private const val TAG = "RdpClient"
         const val RDP_DEFAULT_PORT = 3389
-        const val CONNECT_TIMEOUT_MS = 10_000
-        const val READ_TIMEOUT_MS = 30_000
+        // Increased for Tailscale/VPN relay latency
+        const val CONNECT_TIMEOUT_MS = 20_000
+        const val READ_TIMEOUT_MS    = 60_000
 
         // Protocol flags
         const val PROTOCOL_RDP       = 0x00000000
@@ -218,6 +219,7 @@ class RdpClient(
             sock.connect(InetSocketAddress(credentials.host, credentials.port), CONNECT_TIMEOUT_MS)
             sock.soTimeout = READ_TIMEOUT_MS
             sock.tcpNoDelay = true
+            sock.keepAlive = true          // critical for Tailscale/VPN relay
             sock.setPerformancePreferences(0, 2, 1)
 
             socket = sock
@@ -337,6 +339,7 @@ class RdpClient(
             sock.connect(InetSocketAddress(credentials.host, credentials.port), CONNECT_TIMEOUT_MS)
             sock.soTimeout = READ_TIMEOUT_MS
             sock.tcpNoDelay = true
+            sock.keepAlive = true          // critical for Tailscale/VPN relay
 
             socket = sock
             inputStream  = DataInputStream(BufferedInputStream(sock.getInputStream(), 65536))
@@ -363,6 +366,7 @@ class RdpClient(
             true
         } catch (e: Exception) {
             RdpLog.w("Fallback connection failed: ${e.message}", e)
+            cleanup()  // ensure socket is closed even if mid-handshake failure
             false
         }
     }
@@ -1408,6 +1412,7 @@ class RdpClient(
 
     private suspend fun receiveLoop() = withContext(Dispatchers.IO) {
         var consecutiveErrors = 0
+        var consecutiveTimeouts = 0
         while (connected && isActive) {
             try {
                 val packet = readTpkt() ?: break
@@ -1415,8 +1420,19 @@ class RdpClient(
                 processIncomingPdu(packet)
                 latencyMs = System.currentTimeMillis() - pingStart
                 consecutiveErrors = 0
+                consecutiveTimeouts = 0
                 if (performanceMode == RdpPerformance.AUTO) adaptPerformance()
             } catch (e: CancellationException) { break
+            } catch (e: java.net.SocketTimeoutException) {
+                // Transient: VPN/Tailscale relay pause — tolerate up to 10 before giving up
+                consecutiveTimeouts++
+                RdpLog.w("Read timeout ($consecutiveTimeouts/10) — waiting for data (VPN/relay pause?)")
+                if (consecutiveTimeouts > 10) {
+                    _sessionState.emit(RdpSessionState.ERROR)
+                    _error.emit("Connection timed out: no data for ${READ_TIMEOUT_MS * 10 / 1000}s")
+                    break
+                }
+                // No delay needed — soTimeout already waited READ_TIMEOUT_MS
             } catch (e: Exception) {
                 consecutiveErrors++
                 RdpLog.w("Receive error ($consecutiveErrors): ${e.message}")
@@ -1621,8 +1637,9 @@ class RdpClient(
             RdpLog.e("readTpkt: EOFException — server closed the connection: ${e.message}")
             null
         } catch (e: java.net.SocketTimeoutException) {
-            RdpLog.e("readTpkt: SocketTimeoutException — no data within ${READ_TIMEOUT_MS}ms: ${e.message}")
-            null
+            // Rethrow so receiveLoop can treat this as a transient/retryable error
+            // instead of immediately breaking the loop (important for VPN/Tailscale relay)
+            throw e
         } catch (e: java.net.SocketException) {
             RdpLog.e("readTpkt: SocketException — connection reset/aborted: ${e.message}")
             null
