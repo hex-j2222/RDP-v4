@@ -238,6 +238,7 @@ class RdpClient(
     private var negotiatedHybridEx  = false
     private var serverSelectedProtocol: Int = 0
     private var negotiationPresent  = false
+    private var negRspFlags: Int    = 0   // RDP_NEG_RSP flags byte from X.224 CC
     private var forceStandardRdpSecurity = false
     private var sslSocketRef: javax.net.ssl.SSLSocket? = null
     private var mcsUserId: Int = 0
@@ -450,6 +451,7 @@ class RdpClient(
         negotiatedHybridEx  = false
         serverSelectedProtocol = 0
         negotiationPresent  = false
+        negRspFlags         = 0
 
         val header = ByteArray(4)
         inputStream?.readFully(header) ?: return false
@@ -468,6 +470,7 @@ class RdpClient(
             when (negType) {
                 0x02 -> {
                     negotiationPresent = true
+                    negRspFlags = data[8].toInt() and 0xFF
                     val selected =
                         ((data.getOrElse(14) { 0 }.toInt() and 0xFF) shl 24) or
                         ((data.getOrElse(13) { 0 }.toInt() and 0xFF) shl 16) or
@@ -476,7 +479,7 @@ class RdpClient(
                     serverSelectedProtocol = selected
                     negotiatedNla      = (selected and PROTOCOL_HYBRID) != 0
                     negotiatedHybridEx = (selected and PROTOCOL_HYBRID_EX) != 0
-                    RdpLog.d("Server selected: 0x${selected.toString(16)} (NLA=$negotiatedNla, HybridEX=$negotiatedHybridEx)")
+                    RdpLog.d("Server selected: 0x${selected.toString(16)} flags=0x${negRspFlags.toString(16)} (NLA=$negotiatedNla, HybridEX=$negotiatedHybridEx, ExtClientData=${(negRspFlags and 0x01)!=0})")
                 }
                 0x03 -> {
                     negotiationPresent = true
@@ -648,8 +651,27 @@ class RdpClient(
         val secData     = buildClientSecurityData()
         val netData     = buildClientNetworkData()
         val clusterData = buildClientClusterData()
-        RdpLog.d("GCC userData block sizes: core=${coreData.size} sec=${secData.size} net=${netData.size} cluster=${clusterData.size} total=${coreData.size + secData.size + netData.size + clusterData.size}")
-        return wrapInGccConferenceCreateRequest(coreData + secData + netData + clusterData)
+
+        // Extended Client Data Blocks — MUST be included when the server
+        // advertises EXTENDED_CLIENT_DATA_SUPPORTED (0x01) in its X.224 CC
+        // RDP_NEG_RSP flags byte (MS-RDPBCGR §2.2.1.2.1, §2.2.1.3.5–3.8).
+        // Sending them to a server that didn't set this flag is also safe per spec,
+        // so we always include them once the server has responded with flags != 0.
+        // Without them, Windows servers that set this flag will RST the connection
+        // immediately after receiving the MCS Connect Initial.
+        val extData = if ((negRspFlags and 0x01) != 0) {
+            RdpLog.d("Server has EXTENDED_CLIENT_DATA_SUPPORTED — including CS_MONITOR + CS_MCS_MSGCHANNEL + CS_MULTITRANSPORT")
+            buildClientMonitorData() +
+            buildClientMsgChannelData() +
+            buildClientMultitransportData()
+        } else {
+            RdpLog.d("Server did not set EXTENDED_CLIENT_DATA_SUPPORTED — skipping extended blocks")
+            ByteArray(0)
+        }
+
+        val userData = coreData + secData + netData + clusterData + extData
+        RdpLog.d("GCC userData block sizes: core=${coreData.size} sec=${secData.size} net=${netData.size} cluster=${clusterData.size} ext=${extData.size} total=${userData.size}")
+        return wrapInGccConferenceCreateRequest(userData)
     }
 
     /**
@@ -729,6 +751,68 @@ class RdpClient(
         buf.putShort(0xC004.toShort()); buf.putShort(12)
         buf.putInt(0x0000001C)  // REDIRECTION_SUPPORTED | REDIRECTION_VERSION3
         buf.putInt(0)
+        return buf.array()
+    }
+
+    /**
+     * TS_UD_CS_MONITOR (0xC005) — Client Monitor Data (MS-RDPBCGR §2.2.1.3.6)
+     *
+     * Required when server sets EXTENDED_CLIENT_DATA_SUPPORTED in X.224 CC flags.
+     * Describes the client display layout. For a single primary monitor:
+     *   flags       = 0
+     *   monitorCount = 1
+     *   TS_MONITOR_DEF: left=0, top=0, right=width-1, bottom=height-1,
+     *                   flags=0x00000001 (TS_MONITOR_PRIMARY)
+     *
+     * Total: 4 (header) + 4 (flags) + 4 (monitorCount) + 20 (TS_MONITOR_DEF) = 32 bytes
+     */
+    private fun buildClientMonitorData(): ByteArray {
+        val buf = ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putShort(0xC005.toShort())   // type = CS_MONITOR
+        buf.putShort(32)                  // length
+        buf.putInt(0)                     // flags (unused, MUST be 0)
+        buf.putInt(1)                     // monitorCount = 1
+        // TS_MONITOR_DEF (20 bytes):
+        buf.putInt(0)                     // left
+        buf.putInt(0)                     // top
+        buf.putInt(displayWidth - 1)      // right
+        buf.putInt(displayHeight - 1)     // bottom
+        buf.putInt(0x00000001)            // flags = TS_MONITOR_PRIMARY
+        return buf.array()
+    }
+
+    /**
+     * TS_UD_CS_MCS_MSGCHANNEL (0xC006) — Client Message Channel Data
+     * (MS-RDPBCGR §2.2.1.3.7)
+     *
+     * Required when server sets EXTENDED_CLIENT_DATA_SUPPORTED.
+     * Indicates support for the message channel used by Initiate Multitransport.
+     * Total: 4 (header) + 4 (flags) = 8 bytes
+     */
+    private fun buildClientMsgChannelData(): ByteArray {
+        val buf = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putShort(0xC006.toShort())   // type = CS_MCS_MSGCHANNEL
+        buf.putShort(8)                   // length
+        buf.putInt(0)                     // flags (unused, MUST be 0)
+        return buf.array()
+    }
+
+    /**
+     * TS_UD_CS_MULTITRANSPORT (0xC00A) — Client Multitransport Channel Data
+     * (MS-RDPBCGR §2.2.1.3.8)
+     *
+     * Required when server sets EXTENDED_CLIENT_DATA_SUPPORTED.
+     * Indicates support for RDP Multitransport Layer.
+     * flags=0 means we don't actually claim multitransport capability —
+     * this is the minimal "I acknowledge this block" form that satisfies
+     * servers requiring it without committing to multitransport.
+     * Total: 4 (header) + 4 (flags) = 8 bytes
+     */
+    private fun buildClientMultitransportData(): ByteArray {
+        val buf = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putShort(0xC00A.toShort())   // type = CS_MULTITRANSPORT
+        buf.putShort(8)                   // length
+        buf.putInt(0)                     // flags = 0 (no multitransport capability)
         return buf.array()
     }
 
@@ -1151,16 +1235,13 @@ class RdpClient(
                 INFO_ENABLEWINDOWSKEY or
                 INFO_LOGON_NOTIFY
 
+        // TS_INFO_PACKET (MS-RDPBCGR §2.2.1.11.1.1)
         val infoPacketSize = 4 + 4 + 2 + 2 + 2 + 2 + 2 +
                 domainBytes.size + userBytes.size + passBytes.size +
                 shellBytes.size + workBytes.size
 
-        val secHeader = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
-        secHeader.putShort(SEC_INFO_PKT.toShort())
-        secHeader.putShort(0)
-
         val infoBuf = ByteBuffer.allocate(infoPacketSize).order(ByteOrder.LITTLE_ENDIAN)
-        infoBuf.putInt(0x00000000)
+        infoBuf.putInt(0x00000000)           // CodePage
         infoBuf.putInt(infoPacketFlags)
         infoBuf.putShort((domainBytes.size - 2).toShort())
         infoBuf.putShort((userBytes.size   - 2).toShort())
@@ -1173,8 +1254,44 @@ class RdpClient(
         infoBuf.put(shellBytes)
         infoBuf.put(workBytes)
 
-        val payload = secHeader.array() + infoBuf.array().copyOf(infoBuf.position())
-        RdpLog.d("Client Info PDU: domain='${credentials.domain}' user='${credentials.username}' passwordLen=${credentials.password.length} totalPayloadBytes=${payload.size}")
+        // TS_EXTENDED_INFO_PACKET (MS-RDPBCGR §2.2.1.11.1.1.1)
+        // MUST be appended to TS_INFO_PACKET when INFO_UNICODE is set.
+        // FreeRDP always sends this; omitting it causes servers to reject
+        // or misparse the Client Info PDU.
+        //
+        // clientAddressFamily: AF_INET=0x0002, AF_INET6=0x0017
+        // clientAddress: UTF-16LE null-terminated IP string (or empty "")
+        // clientDir: UTF-16LE null-terminated dir string (or empty "")
+        // clientTimeZone: 172 bytes (TS_TIME_ZONE_INFORMATION), all zeros = UTC
+        // clientSessionId: 0
+        // performanceFlags: 0x00000005 (PERF_DISABLE_WALLPAPER | PERF_DISABLE_FULLWINDOWDRAG)
+        val clientAddrBytes = "\u0000".toByteArray(Charsets.UTF_16LE) // empty address + null
+        val clientDirBytes  = "\u0000".toByteArray(Charsets.UTF_16LE) // empty dir + null
+
+        val extBuf = ByteBuffer.allocate(
+            2 + 2 + clientAddrBytes.size + 2 + clientDirBytes.size + 172 + 4 + 4
+        ).order(ByteOrder.LITTLE_ENDIAN)
+
+        extBuf.putShort(0x0002)                               // clientAddressFamily = AF_INET
+        extBuf.putShort(clientAddrBytes.size.toShort())       // cbClientAddress (incl. null)
+        extBuf.put(clientAddrBytes)                           // clientAddress
+        extBuf.putShort(clientDirBytes.size.toShort())        // cbClientDir (incl. null)
+        extBuf.put(clientDirBytes)                            // clientDir
+        repeat(172) { extBuf.put(0) }                        // clientTimeZone (all zeros = UTC)
+        extBuf.putInt(0)                                      // clientSessionId
+        extBuf.putInt(0x00000005)                             // performanceFlags
+
+        // Security header (no encryption for Standard RDP Security with encLevel=0)
+        val secHeader = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN)
+        secHeader.putShort(SEC_INFO_PKT.toShort())
+        secHeader.putShort(0)
+
+        val payload = secHeader.array() +
+                infoBuf.array().copyOf(infoBuf.position()) +
+                extBuf.array().copyOf(extBuf.position())
+
+        RdpLog.d("Client Info PDU: domain='${credentials.domain}' user='${credentials.username}' " +
+                 "passwordLen=${credentials.password.length} totalPayloadBytes=${payload.size} (incl. ExtInfoPacket)")
         sendMcsSendDataRequest(payload)
     }
 
